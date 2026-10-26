@@ -181,6 +181,7 @@ final class Engine: @unchecked Sendable {
 
     /// Runs the whole download and returns the finished file in `destination`.
     func run(destination: URL, ffmpeg: URL?) async throws -> Output {
+        try Task.checkCancellation() // cancelled before it began: don't create a folder
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         switch job.kind {
         case .direct: return try await runDirect(destination: destination, ffmpeg: ffmpeg)

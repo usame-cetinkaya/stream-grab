@@ -111,6 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let item = DownloadManager.shared.items.first, let n = message["n"] as? Int else { return ["ok": false] }
             DownloadManager.shared.setConnections(item.id, n)
             return ["ok": true]
+        case "debugRemove": // tests press a download's × without the UI
+            guard let item = DownloadManager.shared.items.first else { return ["ok": false] }
+            DownloadManager.shared.remove(item.id)
+            return ["ok": true]
         #endif
         default:
             return ["ok": false, "error": "Unknown request"]

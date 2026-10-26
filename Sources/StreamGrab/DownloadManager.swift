@@ -125,14 +125,23 @@ final class DownloadManager: ObservableObject {
         schedule()
     }
 
+    /// Cancels (if running), forgets the download, and deletes its pieces. A finished video in the
+    /// download folder is kept: removing a finished item only clears it from the list.
     func remove(_ id: UUID) {
-        engines[id]?.task.cancel()
+        let task = engines[id]?.task
+        task?.cancel()
         engines[id] = nil
         items.removeAll { $0.id == id }
         maps[id] = nil
-        try? FileManager.default.removeItem(at: workDir(id))
         changed()
         schedule()
+        let dir = workDir(id)
+        // Delete only once the download has fully stopped, so a piece that was still arriving
+        // can't land in the folder after it's gone.
+        Task.detached {
+            await task?.value
+            try? FileManager.default.removeItem(at: dir)
+        }
     }
 
     func clearFinished() {
