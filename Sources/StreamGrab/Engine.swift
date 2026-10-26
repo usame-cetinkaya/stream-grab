@@ -1,0 +1,336 @@
+import Foundation
+
+/// What the browser extension (or the "Add URL" field) asks us to download.
+struct Job: Codable, Hashable {
+    enum Kind: String, Codable { case hls, direct }
+    var kind: Kind
+    var url: String
+    var audioURL: String?
+    var title: String
+    var quality: String?
+    var pageURL: String?
+    var headers: [String: String] = [:]
+}
+
+/// Downloads one job into a work folder, piece by piece, then merges it into the final file.
+/// Finished pieces stay on disk, so a paused or interrupted download resumes where it left off.
+final class Engine: @unchecked Sendable {
+    enum Phase: String { case preparing, downloading, merging }
+
+    struct Snapshot {
+        var phase: Phase = .preparing
+        var piecesDone = 0
+        var piecesTotal = 0
+        var bytesDone: Int64 = 0
+        var totalBytes: Int64?   // exact for direct downloads, estimated for HLS
+        var bytesPerSecond: Double = 0
+    }
+
+    private struct Piece {
+        var name: String
+        var url: URL
+        var range: ClosedRange<Int64>?
+        var key: HLS.Key?
+    }
+
+    let job: Job
+    let workDir: URL
+    private let connections: Int
+    private let fetcher: Fetcher
+    private let lock = NSLock()
+    private var snap = Snapshot()
+    private var keys: [URL: Data] = [:]
+    private var lastSample = Date()
+
+    init(job: Job, workDir: URL, connections: Int) {
+        self.job = job
+        self.workDir = workDir
+        self.connections = max(1, connections)
+        fetcher = Fetcher(headers: job.headers, connections: connections)
+    }
+
+    deinit { fetcher.invalidate() }
+
+    func snapshot() -> Snapshot {
+        let now = Date()
+        let bytes = fetcher.takeReceivedBytes()
+        lock.lock(); defer { lock.unlock() }
+        let dt = now.timeIntervalSince(lastSample)
+        lastSample = now
+        if dt > 0 {
+            let instant = Double(bytes) / dt
+            snap.bytesPerSecond = snap.bytesPerSecond == 0 ? instant : snap.bytesPerSecond * 0.6 + instant * 0.4
+        }
+        return snap
+    }
+
+    private func update(_ change: (inout Snapshot) -> Void) {
+        lock.lock(); change(&snap); lock.unlock()
+    }
+
+    /// Runs the whole download and returns the finished file in `destination`.
+    func run(destination: URL, ffmpeg: URL?) async throws -> URL {
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        switch job.kind {
+        case .direct: return try await runDirect(destination: destination)
+        case .hls: return try await runHLS(destination: destination, ffmpeg: ffmpeg)
+        }
+    }
+
+    // MARK: - Direct files (multi-connection, like IDM)
+
+    private func runDirect(destination: URL) async throws -> URL {
+        guard let url = URL(string: job.url) else { throw GrabError("Invalid URL.") }
+        var pieces: [Piece] = []
+        var total: Int64?
+        var ext = url.pathExtension.lowercased()
+
+        let probe = try await fetcher.head(url, range: 0 ... 0)
+        if ext.isEmpty || ext.count > 4 { ext = Self.fileExtension(forMIME: probe.mimeType) ?? "mp4" }
+        if probe.statusCode == 206, let cr = probe.value(forHTTPHeaderField: "Content-Range"),
+           let size = cr.split(separator: "/").last.flatMap({ Int64($0) }), size > 0 {
+            total = size
+            let chunk = max(4 << 20, size / 2000)
+            var start: Int64 = 0
+            while start < size {
+                let end = min(start + chunk, size) - 1
+                pieces.append(Piece(name: String(format: "d%06d", pieces.count), url: url, range: start ... end))
+                start = end + 1
+            }
+        } else {
+            // No range support: one connection, restarts from zero after a pause.
+            total = probe.expectedContentLength > 0 ? probe.expectedContentLength : nil
+            pieces = [Piece(name: "d000000", url: url)]
+        }
+        update { $0.totalBytes = total }
+
+        try await fetchAll(pieces)
+        update { $0.phase = .merging }
+        let out = workDir.appendingPathComponent("merged.\(ext)")
+        try concatenate(pieces.map(\.name), into: out)
+        return try moveToDestination(out, folder: destination, ext: ext)
+    }
+
+    // MARK: - HLS
+
+    private func runHLS(destination: URL, ffmpeg: URL?) async throws -> URL {
+        guard let url = URL(string: job.url) else { throw GrabError("Invalid URL.") }
+        var (text, base) = try await fetcher.text(url)
+        var audioURL = job.audioURL.flatMap(URL.init(string:))
+        if HLS.isMaster(text) {
+            // Given a master playlist (e.g. pasted by hand): take the best quality.
+            guard let best = HLS.parseMaster(text, base: base).first, let u = URL(string: best.url) else {
+                throw GrabError("The playlist has no playable variants.")
+            }
+            audioURL = audioURL ?? best.audioURL.flatMap(URL.init(string:))
+            (text, base) = try await fetcher.text(u)
+        }
+        let video = HLS.parseMedia(text, base: base)
+        var audio: HLS.MediaPlaylist?
+        if let audioURL {
+            let (t, b) = try await fetcher.text(audioURL)
+            audio = HLS.parseMedia(t, base: b)
+        }
+        if video.drm || audio?.drm == true {
+            throw GrabError("This video is DRM-protected, so it can't be downloaded.")
+        }
+        if video.isLive { throw GrabError("This is a live stream. Only on-demand videos can be downloaded.") }
+        if video.segments.isEmpty { throw GrabError("The playlist has no segments.") }
+
+        func pieces(_ p: HLS.MediaPlaylist, prefix: String) -> [Piece] {
+            var list: [Piece] = []
+            if let i = p.initSegment { list.append(Piece(name: "\(prefix)init", url: i.url, range: i.range)) }
+            for (n, s) in p.segments.enumerated() {
+                list.append(Piece(name: String(format: "\(prefix)%06d", n), url: s.url, range: s.range, key: s.key))
+            }
+            return list
+        }
+        let videoPieces = pieces(video, prefix: "v")
+        let audioPieces = audio.map { pieces($0, prefix: "a") } ?? []
+
+        try await fetchAll(videoPieces + audioPieces)
+        update { $0.phase = .merging }
+
+        let vExt = video.isFragmentedMP4 ? "mp4" : "ts"
+        let videoFile = workDir.appendingPathComponent("video.\(vExt)")
+        try concatenate(videoPieces.map(\.name), into: videoFile)
+        var audioFile: URL?
+        if let audio {
+            let aExt = audio.isFragmentedMP4 ? "m4a" : (audio.segments.first?.url.pathExtension.lowercased() == "aac" ? "aac" : "ts")
+            audioFile = workDir.appendingPathComponent("audio.\(aExt)")
+            try concatenate(audioPieces.map(\.name), into: audioFile!)
+        }
+
+        if let ffmpeg {
+            for ext in ["mp4", "mkv"] {
+                let out = workDir.appendingPathComponent("final.\(ext)")
+                if try await Self.remux(ffmpeg: ffmpeg, video: videoFile, audio: audioFile, output: out) {
+                    return try moveToDestination(out, folder: destination, ext: ext)
+                }
+            }
+        }
+        // No ffmpeg (or it failed): keep the raw stream; .ts plays in IINA/VLC, fMP4 plays everywhere.
+        let result = try moveToDestination(videoFile, folder: destination, ext: vExt)
+        if let audioFile {
+            _ = try moveToDestination(audioFile, folder: destination, ext: audioFile.pathExtension, suffix: " (audio)")
+        }
+        return result
+    }
+
+    private static func remux(ffmpeg: URL, video: URL, audio: URL?, output: URL) async throws -> Bool {
+        var args = ["-hide_banner", "-loglevel", "error", "-y", "-i", video.path]
+        if let audio { args += ["-i", audio.path, "-map", "0:v:0", "-map", "1:a:0"] }
+        else { args += ["-map", "0:v?", "-map", "0:a?"] }
+        args += ["-c", "copy"]
+        if output.pathExtension == "mp4" { args += ["-movflags", "+faststart"] }
+        args.append(output.path)
+
+        let p = Process()
+        p.executableURL = ffmpeg
+        p.arguments = args
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        try p.run()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { cont in
+                DispatchQueue.global().async { p.waitUntilExit(); cont.resume() }
+            }
+        } onCancel: { p.terminate() }
+        try Task.checkCancellation()
+        return p.terminationStatus == 0 && FileManager.default.fileExists(atPath: output.path)
+    }
+
+    // MARK: - Pieces
+
+    private func fetchAll(_ pieces: [Piece]) async throws {
+        let fm = FileManager.default
+        var todo: [Piece] = []
+        var doneBytes: Int64 = 0
+        for p in pieces {
+            let path = workDir.appendingPathComponent(p.name).path
+            if let size = (try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber {
+                doneBytes += size.int64Value
+            } else {
+                todo.append(p)
+            }
+        }
+        let alreadyDone = pieces.count - todo.count
+        update {
+            $0.phase = .downloading
+            $0.piecesTotal = pieces.count
+            $0.piecesDone = alreadyDone
+            $0.bytesDone = doneBytes
+        }
+
+        try await withThrowingTaskGroup(of: Int64.self) { group in
+            var iterator = todo.makeIterator()
+            for _ in 0 ..< connections {
+                guard let p = iterator.next() else { break }
+                group.addTask { try await self.fetchPiece(p) }
+            }
+            while let bytes = try await group.next() {
+                update {
+                    $0.piecesDone += 1
+                    $0.bytesDone += bytes
+                    if job.kind == .hls, $0.piecesDone > 0 {
+                        $0.totalBytes = $0.bytesDone * Int64($0.piecesTotal) / Int64($0.piecesDone)
+                    }
+                }
+                if let p = iterator.next() { group.addTask { try await self.fetchPiece(p) } }
+            }
+        }
+    }
+
+    private func fetchPiece(_ piece: Piece) async throws -> Int64 {
+        let final = workDir.appendingPathComponent(piece.name)
+        let tmp = workDir.appendingPathComponent(piece.name + ".part")
+        var attempt = 0
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await fetcher.download(piece.url, range: piece.range, to: tmp)
+                if let key = piece.key {
+                    let data = try HLS.decryptAES128(try Data(contentsOf: tmp), key: try await keyData(key.url), iv: key.iv ?? Data(count: 16))
+                    try data.write(to: tmp)
+                }
+                try FileManager.default.moveItem(at: tmp, to: final)
+                let size = (try? FileManager.default.attributesOfItem(atPath: final.path))?[.size] as? NSNumber
+                return size?.int64Value ?? 0
+            } catch {
+                attempt += 1
+                if Task.isCancelled || error is CancellationError || attempt >= 5 { throw error }
+                try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)
+            }
+        }
+    }
+
+    private func keyData(_ url: URL) async throws -> Data {
+        if let cached = withLock({ keys[url] }) { return cached }
+        let data = try await fetcher.data(url)
+        guard data.count == 16 else { throw GrabError("The decryption key looks wrong (\(data.count) bytes).") }
+        withLock { keys[url] = data }
+        return data
+    }
+
+    private func withLock<T>(_ body: () -> T) -> T {
+        lock.lock(); defer { lock.unlock() }
+        return body()
+    }
+
+    // MARK: - Files
+
+    private func concatenate(_ names: [String], into output: URL) throws {
+        let fm = FileManager.default
+        try? fm.removeItem(at: output)
+        fm.createFile(atPath: output.path, contents: nil)
+        let out = try FileHandle(forWritingTo: output)
+        defer { try? out.close() }
+        for name in names {
+            let input = try FileHandle(forReadingFrom: workDir.appendingPathComponent(name))
+            defer { try? input.close() }
+            while let chunk = try input.read(upToCount: 8 << 20), !chunk.isEmpty {
+                try out.write(contentsOf: chunk)
+            }
+        }
+    }
+
+    private func moveToDestination(_ file: URL, folder: URL, ext: String, suffix: String = "") throws -> URL {
+        let fm = FileManager.default
+        try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        var base = Self.sanitize(job.title)
+        if let q = job.quality, !q.isEmpty { base += " [\(Self.sanitize(q))]" }
+        base += suffix
+        var target = folder.appendingPathComponent("\(base).\(ext)")
+        var n = 2
+        while fm.fileExists(atPath: target.path) {
+            target = folder.appendingPathComponent("\(base) (\(n)).\(ext)")
+            n += 1
+        }
+        try fm.moveItem(at: file, to: target)
+        return target
+    }
+
+    static func sanitize(_ s: String) -> String {
+        let bad = CharacterSet(charactersIn: "/\\:*?\"<>|\n\r\t").union(.controlCharacters)
+        var cleaned = s.components(separatedBy: bad).joined(separator: " ")
+            .replacingOccurrences(of: "  +", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines.union(CharacterSet(charactersIn: ".")))
+        if cleaned.count > 120 { cleaned = String(cleaned.prefix(120)).trimmingCharacters(in: .whitespaces) }
+        return cleaned.isEmpty ? "video" : cleaned
+    }
+
+    static func fileExtension(forMIME mime: String?) -> String? {
+        switch mime?.lowercased() {
+        case "video/mp4": "mp4"
+        case "video/webm": "webm"
+        case "video/quicktime": "mov"
+        case "video/x-matroska": "mkv"
+        case "video/x-flv": "flv"
+        case "video/mp2t": "ts"
+        case "audio/mp4": "m4a"
+        case "audio/mpeg": "mp3"
+        default: nil
+        }
+    }
+}

@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #111827; --muted: #6b7280; --line: #e5e7eb; --hover: #eff6ff; --accent: #2563eb; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1f2937; --fg: #f9fafb; --muted: #9ca3af; --line: #374151; --hover: #1e3a8a; } }
+  body { margin: 0; width: 320px; font: 13px/1.4 -apple-system, BlinkMacSystemFont, system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 14px; margin: 0; }
+  #status { font-size: 12px; color: var(--muted); }
+  #status.ok::before { content: "● "; color: #16a34a; }
+  #status.bad::before { content: "● "; color: #dc2626; }
+  #list { max-height: 380px; overflow-y: auto; padding: 4px; }
+  .empty { padding: 18px 12px; color: var(--muted); text-align: center; }
+  .group { padding: 6px 8px 2px; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  button.row { all: unset; box-sizing: border-box; width: 100%; display: flex; justify-content: space-between; padding: 7px 8px; border-radius: 6px; cursor: pointer; }
+  button.row:hover { background: var(--hover); }
+  button.row[disabled] { opacity: .5; cursor: default; }
+  .q { font-weight: 600; } .d { color: var(--muted); }
+  footer { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-top: 1px solid var(--line); }
+  #msg { font-size: 12px; color: var(--muted); }
+  #open { all: unset; color: var(--accent); cursor: pointer; font-size: 12px; }
+</style>
+</head>
+<body>
+  <header><h1>StreamGrab</h1><span id="status">Checking…</span></header>
+  <div id="list"></div>
+  <footer><span id="msg"></span><button id="open">Open StreamGrab</button></footer>
+  <script src="popup.js"></script>
+</body>
+</html>

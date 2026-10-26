@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "StreamGrab",
+  "version": "1.0.0",
+  "description": "Adds a “Download this video” button with a quality menu over videos, and downloads them with the StreamGrab Mac app.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAr4KOG2jx+O/EHKjH7zbii2dNcZGb3rh/oJyqxqzj4Sv0UuPSQy80NxLMkgYSGakF5PcttQ25s1r7BIlZ08dFM3Zr9iB4Qwg//hvMf+NO4VxulRcnOPgPfraTkg2ux2FkEecvfu0WxU5v1qtUvxkPUEvYG0EmG10nc16250+Ik7E0CrMxp2Sz/pYKImZ4D5ccESfS//8BHiKkueflvHviTxErelBUAs1Qy1henGUksHAOWBv1OEDlmPAvYlojHiGFXt0W5ZrSMczscDtt9I+wTv14sJ7KjdFbe6UWCK9dU941WX5DtgkmHqVxu14LbZqmFPvSGSlhF0Dt7f/gGJuozQIDAQAB",
+  "permissions": ["webRequest", "webNavigation", "nativeMessaging", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "StreamGrab",
+    "default_popup": "popup.html",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png" }
+  },
+  "icons": { "16": "icons/16.png", "48": "icons/48.png", "128": "icons/128.png" }
+}
