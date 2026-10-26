@@ -3,12 +3,21 @@ const $ = (s) => document.querySelector(s);
 (async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
-  chrome.runtime.sendMessage({ type: 'ping' }).then((res) => {
+  // Whether the app is open: checked now, every 2 s while the popup is open, and right after
+  // "Open StreamGrab" (which starts the app if needed).
+  const refreshStatus = () => chrome.runtime.sendMessage({ type: 'ping' }).then((res) => {
     const running = res?.ok && res.appRunning;
     $('#status').textContent = !res?.ok ? 'App not installed' : running ? `App running${res.ffmpeg ? '' : ' (no ffmpeg)'}` : 'App not running';
     $('#status').className = running ? 'ok' : 'bad';
   });
-  $('#open').onclick = () => chrome.runtime.sendMessage({ type: 'show' });
+  refreshStatus();
+  setInterval(refreshStatus, 2000);
+  $('#open').onclick = async () => {
+    $('#status').textContent = 'Opening…';
+    $('#status').className = '';
+    await chrome.runtime.sendMessage({ type: 'show' });
+    refreshStatus();
+  };
 
   const { items = [] } = (await chrome.runtime.sendMessage({ type: 'items', tabId: tab.id })) || {};
   const list = $('#list');

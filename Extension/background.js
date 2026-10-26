@@ -255,7 +255,12 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       }
       case 'download': return reply(await download(tabId, msg.itemId, msg.quality, msg.label));
       case 'ping': return reply(await native({ type: 'ping' }));
-      case 'show': return reply(await native({ type: 'show' }));
+      case 'show': {
+        const res = await native({ type: 'show' });
+        // The app is open now: let pages show their button without waiting for the next check.
+        if (res.ok) appCheck = { at: Date.now(), running: Promise.resolve(true) };
+        return reply(res);
+      }
     }
   })();
   return true;
