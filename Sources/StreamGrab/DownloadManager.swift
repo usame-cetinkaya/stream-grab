@@ -24,6 +24,9 @@ struct DownloadItem: Identifiable, Codable {
     var connections: Int?
     /// The server answered "Too many requests" (HTTP 429), so connections were lowered.
     var rateLimited: Bool?
+    /// Automatic retries after a temporary failure: how many so far, and when the next one is due.
+    var autoRetries: Int?
+    var retryAt: Date?
 
     var isActive: Bool { status == .downloading || status == .merging }
 
@@ -58,6 +61,9 @@ final class Settings: ObservableObject {
     @Published var simultaneous: Int {
         didSet { d.set(simultaneous, forKey: "simultaneous") }
     }
+    @Published var autoRetry: Bool {
+        didSet { d.set(autoRetry, forKey: "autoRetry") }
+    }
 
     static let connectionChoices = [1, 2, 4, 8, 12, 16]
 
@@ -68,6 +74,7 @@ final class Settings: ObservableObject {
         let saved = d.object(forKey: "connections") as? Int ?? 8
         connections = Self.connectionChoices.min { abs($0 - saved) < abs($1 - saved) } ?? 8
         simultaneous = d.object(forKey: "simultaneous") as? Int ?? 3
+        autoRetry = d.object(forKey: "autoRetry") as? Bool ?? true
     }
 }
 
@@ -80,6 +87,8 @@ final class DownloadManager: ObservableObject {
     @Published private(set) var maps: [UUID: Engine.PieceMap] = [:]
     private var engines: [UUID: (engine: Engine, task: Task<Void, Never>)] = [:]
     private var timer: Timer?
+    private var piecesAtStart: [UUID: Int] = [:]
+    private var network: NetworkWatcher?
     private var dirty = false
     private let store = Paths.support.appendingPathComponent("downloads.json")
     private let settings = Settings.shared
@@ -97,6 +106,9 @@ final class DownloadManager: ObservableObject {
         }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             Task { @MainActor in DownloadManager.shared.tick() }
+        }
+        network = NetworkWatcher {
+            Task { @MainActor in DownloadManager.shared.networkReturned() }
         }
     }
 
@@ -121,8 +133,26 @@ final class DownloadManager: ObservableObject {
     }
 
     func resume(_ id: UUID) {
-        set(id) { $0.status = .queued; $0.error = nil; $0.note = nil }
+        set(id) { $0.status = .queued; $0.error = nil; $0.note = nil; $0.retryAt = nil }
         schedule()
+    }
+
+    /// The Retry button: start over with a fresh set of automatic retries.
+    func retryNow(_ id: UUID) {
+        set(id) { $0.autoRetries = nil }
+        resume(id)
+    }
+
+    /// Cancel a pending automatic retry; the download stays in the list, paused.
+    func stopRetrying(_ id: UUID) {
+        set(id) { $0.retryAt = nil; $0.autoRetries = nil; $0.status = .paused }
+    }
+
+    /// Back online: retries waiting for a network problem to clear can go now.
+    func networkReturned() {
+        for item in items where item.status == .failed && item.retryAt != nil {
+            set(item.id) { $0.retryAt = Date().addingTimeInterval(2) }
+        }
     }
 
     /// Cancels (if running), forgets the download, and deletes its pieces. A finished video in the
@@ -183,6 +213,7 @@ final class DownloadManager: ObservableObject {
     private func start(_ item: DownloadItem) {
         let id = item.id
         let engine = Engine(job: item.job, workDir: workDir(id), connections: item.connections ?? settings.connections)
+        piecesAtStart[id] = item.piecesDone
         let folder = settings.folder
         set(id) { $0.status = .downloading; $0.error = nil; $0.startClock() }
         let task = Task.detached { [engine] in
@@ -207,6 +238,7 @@ final class DownloadManager: ObservableObject {
             item.stopClock()
             if let file {
                 item.status = .completed
+                item.autoRetries = nil
                 item.file = file
                 item.note = note
                 item.job.headers = [:] // don't keep cookies around once they're no longer needed
@@ -215,8 +247,24 @@ final class DownloadManager: ObservableObject {
             } else {
                 item.status = .failed
                 item.error = (error as NSError?).map { ($0 as? LocalizedError)?.errorDescription ?? $0.localizedDescription }
+                // Temporary problem: try again later, waiting longer each time. A try that got
+                // somewhere before failing starts the count over.
+                if settings.autoRetry, let error, RetryPolicy.isTransient(error) {
+                    let progressed = item.piecesDone > (piecesAtStart[id] ?? item.piecesDone)
+                    let attempt = (progressed ? 0 : item.autoRetries ?? 0) + 1
+                    if attempt <= RetryPolicy.maxAttempts {
+                        item.autoRetries = attempt
+                        item.retryAt = Date().addingTimeInterval(RetryPolicy.delay(attempt: attempt, retryAfter: RetryPolicy.retryAfter(error)))
+                    } else {
+                        item.retryAt = nil
+                        item.error = (item.error ?? "Failed") + " (gave up after \(RetryPolicy.maxAttempts) automatic retries)"
+                    }
+                } else {
+                    item.retryAt = nil
+                }
             }
         }
+        piecesAtStart[id] = nil
         if file != nil { try? FileManager.default.removeItem(at: workDir(id)) }
         if file != nil { maps[id] = nil } else { maps[id]?.runs.removeAll { $0.active } }
         if file != nil { NSApp.requestUserAttention(.informationalRequest) }
@@ -225,6 +273,10 @@ final class DownloadManager: ObservableObject {
 
     private func tick() {
         for (id, entry) in engines { apply(entry.engine.snapshot(), to: id) }
+        let now = Date()
+        for item in items where item.status == .failed {
+            if let at = item.retryAt, at <= now { resume(item.id) }
+        }
         if dirty { save() }
     }
 

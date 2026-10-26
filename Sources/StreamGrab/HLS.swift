@@ -237,6 +237,8 @@ enum HLS {
 
 struct GrabError: LocalizedError {
     let message: String
-    init(_ message: String) { self.message = message }
+    /// Worth retrying later (see RetryPolicy); most of our own errors are permanent.
+    var transient = false
+    init(_ message: String, transient: Bool = false) { self.message = message; self.transient = transient }
     var errorDescription: String? { message }
 }

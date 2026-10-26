@@ -147,7 +147,7 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         lock.lock(); let w = waiters.removeValue(forKey: task.taskIdentifier); lock.unlock()
         guard let w else { return }
         if let error { w.continuation.resume(throwing: error) }
-        else { w.continuation.resume(with: w.result ?? .failure(GrabError("Download finished without data."))) }
+        else { w.continuation.resume(with: w.result ?? .failure(GrabError("Download finished without data.", transient: true))) }
     }
 }
 

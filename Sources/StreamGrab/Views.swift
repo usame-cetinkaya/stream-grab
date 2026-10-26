@@ -80,6 +80,14 @@ struct DownloadRow: View {
                 }
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(detail).font(.caption).foregroundStyle(item.status == .failed ? .red : .secondary).lineLimit(2)
+                    if item.status == .failed, let at = item.retryAt {
+                        // Re-rendered every second for the countdown.
+                        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            Text(Self.retryText(at: at, now: ctx.date, attempt: item.autoRetries ?? 1))
+                                .font(.caption).foregroundStyle(.orange).monospacedDigit()
+                        }
+                        .fixedSize()
+                    }
                     Spacer(minLength: 4)
                     if showsConnections { connectionControl }
                 }
@@ -143,7 +151,10 @@ struct DownloadRow: View {
             case .paused:
                 iconButton("play.fill", "Resume") { manager.resume(item.id) }
             case .failed:
-                iconButton("arrow.clockwise", "Retry") { manager.resume(item.id) }
+                iconButton("arrow.clockwise", item.retryAt == nil ? "Retry" : "Retry now") { manager.retryNow(item.id) }
+                if item.retryAt != nil {
+                    iconButton("pause.fill", "Stop retrying automatically") { manager.stopRetrying(item.id) }
+                }
             case .completed:
                 iconButton("play.rectangle", "Open") { manager.open(item.id) }
                 iconButton("magnifyingglass", "Show in Finder") { manager.reveal(item.id) }
@@ -162,7 +173,7 @@ struct DownloadRow: View {
     private var icon: String {
         switch item.status {
         case .completed: "checkmark.circle.fill"
-        case .failed: "exclamationmark.triangle.fill"
+        case .failed: item.retryAt == nil ? "exclamationmark.triangle.fill" : "arrow.clockwise.circle.fill"
         case .paused: "pause.circle.fill"
         case .queued: "clock.fill"
         case .downloading, .merging: "arrow.down.circle.fill"
@@ -172,10 +183,17 @@ struct DownloadRow: View {
     private var color: Color {
         switch item.status {
         case .completed: .green
-        case .failed: .red
+        case .failed: item.retryAt == nil ? .red : .orange
         case .paused, .queued: .secondary
         case .downloading, .merging: .accentColor
         }
+    }
+
+    /// "Retrying in 0:25 (try 2 of 8)"
+    static func retryText(at: Date, now: Date, attempt: Int) -> String {
+        let secs = max(0, Int(at.timeIntervalSince(now).rounded(.up)))
+        let when = secs == 0 ? "Retrying…" : "Retrying in \(secs / 60):\(String(format: "%02d", secs % 60))"
+        return "\(when) (try \(attempt) of \(RetryPolicy.maxAttempts))"
     }
 
     /// "under 1s", "12s", "1m 12s", "1h 5m"
@@ -320,10 +338,11 @@ struct SettingsView: View {
                 Picker("Downloads at the same time", selection: $settings.simultaneous) {
                     ForEach(1 ... 6, id: \.self) { Text("\($0)").tag($0) }
                 }
+                Toggle("Retry failed downloads automatically", isOn: $settings.autoRetry)
             } header: {
                 Text("Downloads")
             } footer: {
-                Text("More connections can speed up large video files on servers that allow it.")
+                Text("More connections can speed up large video files on servers that allow it. Downloads that fail because of a network or server problem are retried up to 8 times, waiting longer each time.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

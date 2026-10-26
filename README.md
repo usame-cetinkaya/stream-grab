@@ -21,6 +21,10 @@ the whole stream.
   HTTP 429 ("too many requests"), that download drops a connection per refusal, down to 1, and retries the
   refused piece after the server's Retry-After wait.
 - The progress bar shows finished parts and the piece each connection is fetching right now.
+- Downloads that fail because of a network or server problem (timeouts, dropped connections, HTTP 5xx/429/408)
+  are retried automatically: up to 8 times, waiting 5 s, 15 s, 30 s, 1 min, 2 min, 5 min, then 10 min (or the
+  server's Retry-After), with a countdown in the list. A try that made progress starts the count over, and
+  waiting retries go right away when the Mac gets back online. Permanent errors (404, DRM…) aren't retried.
 - Pause, resume (even after quitting the app), retry, and a list of finished downloads with how long they took.
 - Paste a link into the app to download it without the browser.
 
@@ -68,7 +72,8 @@ and separate audio tracks are saved next to the video instead of inside it.
 | `Sources/StreamGrab/DASH.swift` | MPD parsing (templates, timelines, segment lists, single files) |
 | `Sources/StreamGrab/Engine.swift` | Piece downloads, resume, merge, ffmpeg remux |
 | `Sources/StreamGrab/Fetcher.swift` | URLSession wrapper that replays browser headers |
-| `Sources/StreamGrab/DownloadManager.swift` | Queue, pause/resume, persistence, settings |
+| `Sources/StreamGrab/DownloadManager.swift` | Queue, pause/resume, automatic retries, persistence, settings |
+| `Sources/StreamGrab/Retry.swift` | Which errors are retried, back-off delays, back-online detection |
 | `Sources/StreamGrab/Views.swift` | SwiftUI download list, setup guide, settings |
 | `Sources/StreamGrab/Setup.swift` | Installs host manifests and the extension folder on launch |
 | `Extension/` | Chrome MV3 extension (fixed ID `ljopggppagmplkghfflbeopnlacihime` via `key`) |
