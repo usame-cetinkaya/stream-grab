@@ -137,6 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             alert.addButton(withTitle: "Cancel")
             if alert.runModal() != .alertFirstButtonReturn { return .terminateCancel }
         }
+        DownloadManager.shared.stopClocks()
         DownloadManager.shared.save()
         return .terminateNow
     }

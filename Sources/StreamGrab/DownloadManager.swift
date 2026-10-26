@@ -16,8 +16,22 @@ struct DownloadItem: Identifiable, Codable {
     var totalBytes: Int64?
     var speed: Double = 0
     var created = Date()
+    /// Time spent actually downloading (paused and queued time excluded). Optional so lists
+    /// saved by older versions still load.
+    var elapsed: Double?
+    var runningSince: Date?
 
     var isActive: Bool { status == .downloading || status == .merging }
+
+    mutating func startClock() {
+        if runningSince == nil { runningSince = Date() }
+    }
+
+    mutating func stopClock() {
+        guard let since = runningSince else { return }
+        elapsed = (elapsed ?? 0) + Date().timeIntervalSince(since)
+        runningSince = nil
+    }
 
     var fraction: Double? {
         if status == .completed { return 1 }
@@ -70,6 +84,7 @@ final class DownloadManager: ObservableObject {
             items = saved.map { item in
                 var item = item
                 if item.isActive || item.status == .queued { item.status = .paused }
+                item.runningSince = nil // time before an unexpected exit can't be known
                 item.speed = 0
                 return item
             }
@@ -93,7 +108,7 @@ final class DownloadManager: ObservableObject {
     func pause(_ id: UUID) {
         engines[id]?.task.cancel()
         engines[id] = nil
-        set(id) { $0.status = .paused; $0.speed = 0 }
+        set(id) { $0.status = .paused; $0.speed = 0; $0.stopClock() }
         schedule()
     }
 
@@ -142,7 +157,7 @@ final class DownloadManager: ObservableObject {
         let id = item.id
         let engine = Engine(job: item.job, workDir: workDir(id), connections: settings.connections)
         let folder = settings.folder
-        set(id) { $0.status = .downloading; $0.error = nil }
+        set(id) { $0.status = .downloading; $0.error = nil; $0.startClock() }
         let task = Task.detached { [engine] in
             do {
                 let out = try await engine.run(destination: folder, ffmpeg: Paths.ffmpeg)
@@ -162,6 +177,7 @@ final class DownloadManager: ObservableObject {
         engines[id] = nil
         set(id) { item in
             item.speed = 0
+            item.stopClock()
             if let file {
                 item.status = .completed
                 item.file = file
@@ -209,6 +225,12 @@ final class DownloadManager: ObservableObject {
     private func updateBadge() {
         let n = items.filter { $0.isActive || $0.status == .queued }.count
         NSApp?.dockTile.badgeLabel = n > 0 ? "\(n)" : nil
+    }
+
+    /// Called on quit: count the time of running downloads up to now.
+    func stopClocks() {
+        for i in items.indices where items[i].runningSince != nil { items[i].stopClock() }
+        dirty = true
     }
 
     func save() {

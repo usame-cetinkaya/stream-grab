@@ -143,11 +143,27 @@ struct DownloadRow: View {
         }
     }
 
+    /// "under 1s", "12s", "1m 12s", "1h 5m"
+    static func duration(_ seconds: Double) -> String {
+        if seconds < 1 { return "under 1s" }
+        let f = DateComponentsFormatter()
+        f.allowedUnits = [.hour, .minute, .second]
+        f.unitsStyle = .abbreviated
+        f.maximumUnitCount = 2
+        return f.string(from: seconds.rounded()) ?? "\(Int(seconds))s"
+    }
+
     private var detail: String {
         let size = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
         switch item.status {
         case .completed:
-            return [item.totalBytes.map(size), item.file?.lastPathComponent].compactMap { $0 }.joined(separator: " · ")
+            var took: String?
+            var average: String?
+            if let t = item.elapsed {
+                took = "took \(Self.duration(t))"
+                if t >= 1, let total = item.totalBytes { average = "\(size(Int64(Double(total) / t)))/s" }
+            }
+            return [item.totalBytes.map(size), took, average, item.file?.lastPathComponent].compactMap { $0 }.joined(separator: " · ")
         case .failed:
             return item.error ?? "Failed"
         case .merging:
