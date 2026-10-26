@@ -1,6 +1,6 @@
 # StreamGrab
 
-An IDM-style video grabber for macOS. Play a video in Chrome and a **Download this video** button
+An IDM-style video grabber for macOS (Apple Silicon only, macOS 13+). Play a video in Chrome and a **Download this video** button
 appears over it; open its menu, pick a quality (1080p, 720p, 480p…), and the StreamGrab app downloads
 the whole stream.
 
