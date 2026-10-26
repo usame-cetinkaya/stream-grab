@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds StreamGrab.app (Apple Silicon) with the Chrome extension bundled inside, plus a .dmg.
+# Builds StreamGrab.app (Apple Silicon) with the Chrome extension bundled inside, plus a .dmg
+# and a zip of the extension for loading unpacked in Chrome.
 #
-#   scripts/build.sh                          release build + dmg
+#   scripts/build.sh                          release build + dmg + extension zip
 #   CONFIGURATION=debug scripts/build.sh      debug build, no dmg
 #   VERSION=1.2.3 scripts/build.sh            override the version
 set -euo pipefail
@@ -46,6 +47,12 @@ if [ "$CONFIGURATION" = "release" ]; then
   ln -s /Applications "$STAGING/Applications"
   hdiutil create -quiet -volname "$APP_NAME" -srcfolder "$STAGING" -fs HFS+ -format ULMO -ov \
     "$DIST/$APP_NAME-$VERSION-arm64.dmg"
+
+  # Unzips to a "StreamGrab Chrome Extension" folder, ready for chrome://extensions → Load unpacked.
+  EXT_STAGING="$(mktemp -d)"
+  cp -R "$APP/Contents/Resources/Extension" "$EXT_STAGING/StreamGrab Chrome Extension"
+  (cd "$EXT_STAGING" && zip -qrX - "StreamGrab Chrome Extension") > "$DIST/$APP_NAME-Chrome-Extension-$VERSION.zip"
+  rm -rf "$EXT_STAGING"
 fi
 
 du -sh "$DIST"/*

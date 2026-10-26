@@ -18,10 +18,15 @@ YouTube's player doesn't load a single stream file, so YouTube videos aren't pic
 
 ## Install
 
-1. Build: `scripts/build.sh` → `dist/StreamGrab.app` (and a `.dmg`). Move the app to /Applications and open it once.
+Download the latest `.dmg` and `StreamGrab-Chrome-Extension-*.zip` from
+[Releases](https://github.com/usame-cetinkaya/stream-grab/releases), or build locally:
+
+1. App: open the DMG (or run `scripts/build.sh` → `dist/StreamGrab.app`), move the app to /Applications and open it once.
+   It's ad-hoc signed, so the first launch needs right-click → **Open**.
    Opening it registers it with Chrome, Brave, Edge, Vivaldi, Arc and Chromium (a native-messaging host manifest).
 2. In Chrome, open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, and choose
-   `~/Library/Application Support/StreamGrab/Chrome Extension` (the app's **Show Extension Folder** button reveals it).
+   the unzipped `StreamGrab Chrome Extension` folder, or the copy the app keeps at
+   `~/Library/Application Support/StreamGrab/Chrome Extension` (its **Show Extension Folder** button reveals it).
 3. Reload open tabs and play a video.
 
 Optional but recommended: `brew install ffmpeg`. Without it, HLS downloads are saved as `.ts`
@@ -57,5 +62,12 @@ Optional but recommended: `brew install ffmpeg`. Without it, HLS downloads are s
 
 Downloads in progress live in `~/Library/Caches/StreamGrab/<id>/`; the list is kept in
 `~/Library/Application Support/StreamGrab/downloads.json`.
+
+## Releases
+
+Push a version tag (`git tag 1.2.0 && git push origin 1.2.0`, or `v1.2.0`). GitHub Actions builds the
+app with that version, the DMG, and the extension zip (same version in its manifest), and publishes
+them as a GitHub release. Pushes to `main` and pull requests run the same build and keep the
+files as workflow artifacts.
 
 Building needs only the Command Line Tools (no Xcode). `scripts/make-icons.swift` regenerates the icons.

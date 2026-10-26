@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["*.*.*", "v*.*.*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check extension scripts
+        run: for f in Extension/*.js; do node --check "$f"; done
+
+      - name: Build
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then export VERSION="${GITHUB_REF_NAME#v}"; fi
+          scripts/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StreamGrab
+          path: |
+            dist/*.dmg
+            dist/*.zip
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'NOTES'
+          ## Install
+
+          1. **App:** open `StreamGrab-*-arm64.dmg`, drag StreamGrab to Applications, and open it once.
+             It's ad-hoc signed, so the first time right-click it → **Open** (or allow it in
+             System Settings → Privacy & Security). Opening it connects it to Chrome, Brave, Edge, Vivaldi and Arc.
+          2. **Chrome extension:** unzip `StreamGrab-Chrome-Extension-*.zip`, open `chrome://extensions`,
+             turn on **Developer mode**, click **Load unpacked**, and choose the
+             `StreamGrab Chrome Extension` folder. Keep the folder where it is; Chrome loads it from there.
+             (The app also keeps a copy at `~/Library/Application Support/StreamGrab/Chrome Extension`.)
+             When updating, replace the folder's contents and click the reload icon on the extension.
+          3. Optional: `brew install ffmpeg` so streams are saved as .mp4 with audio merged.
+
+          Apple Silicon only, macOS 13 or later.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*.zip \
+            --title "StreamGrab $GITHUB_REF_NAME" --notes-file notes.md --generate-notes
