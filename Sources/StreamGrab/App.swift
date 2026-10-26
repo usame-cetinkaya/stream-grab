@@ -73,7 +73,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     #if DEBUG
     /// Debug builds: render a window to a PNG (for checking the UI without screen-recording access).
     private func snapshot(_ target: NSWindow, to path: String) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+        let delay = Double(ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT_DELAY"] ?? "") ?? 2.5
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             guard let view = target.contentView?.superview, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
             view.cacheDisplay(in: view.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))

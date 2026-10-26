@@ -70,7 +70,9 @@ struct DownloadRow: View {
                     }
                 }
                 if item.status != .completed && item.status != .failed {
-                    if let f = item.fraction, item.status != .merging {
+                    if let map = manager.maps[item.id], item.status == .downloading || item.status == .paused {
+                        PieceBar(map: map, connections: map.runs.filter(\.active).count)
+                    } else if let f = item.fraction, item.status != .merging {
                         ProgressView(value: f)
                     } else {
                         ProgressView().progressViewStyle(.linear)
@@ -193,6 +195,42 @@ struct DownloadRow: View {
             return parts.joined(separator: " · ")
         }
     }
+}
+
+/// IDM-style bar: finished parts in the accent colour, and each piece a connection is
+/// downloading right now as its own segment that fills up as it arrives.
+struct PieceBar: View {
+    let map: Engine.PieceMap
+    let connections: Int
+
+    var body: some View {
+        Canvas { ctx, size in
+            let h = size.height
+            ctx.fill(Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: h / 2),
+                      with: .color(.secondary.opacity(0.18)))
+            ctx.clip(to: Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: h / 2))
+            for run in map.runs {
+                let x = run.start * size.width
+                let w = max(run.length * size.width, run.active ? 2 : 0.5)
+                if run.active {
+                    // The whole piece this connection owns, faintly, then what has arrived so far.
+                    ctx.fill(Path(CGRect(x: x, y: 0, width: w, height: h)), with: .color(Self.active.opacity(0.28)))
+                    ctx.fill(Path(CGRect(x: x, y: 0, width: max(w * run.fill, 1), height: h)), with: .color(Self.active))
+                    // A divider so neighbouring connections stay distinguishable.
+                    ctx.fill(Path(CGRect(x: x, y: 0, width: 1, height: h)), with: .color(.black.opacity(0.35)))
+                } else {
+                    ctx.fill(Path(CGRect(x: x, y: 0, width: w, height: h)), with: .color(.accentColor))
+                }
+            }
+        }
+        .frame(height: 8)
+        .help(connections > 0
+              ? "Blue: downloaded. Green: \(connections) piece\(connections == 1 ? "" : "s") being downloaded right now, one per connection."
+              : "Blue: downloaded.")
+        .accessibilityLabel("Download progress by piece")
+    }
+
+    static let active = Color(nsColor: .systemGreen)
 }
 
 struct SetupGuide: View {

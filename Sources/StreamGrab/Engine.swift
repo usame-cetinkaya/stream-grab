@@ -48,6 +48,28 @@ final class Engine: @unchecked Sendable {
         var bytesDone: Int64 = 0
         var totalBytes: Int64?   // exact for direct downloads, estimated for streams
         var bytesPerSecond: Double = 0
+        var map: PieceMap?
+    }
+
+    /// The file laid out as pieces, for the progress bar: finished runs and the pieces
+    /// each connection is fetching right now (positions are fractions of the whole file).
+    struct PieceMap: Equatable {
+        struct Run: Equatable {
+            var start: Double
+            var length: Double
+            var fill: Double     // 1 for finished pieces, 0..<1 for a piece being downloaded
+            var active: Bool
+        }
+        var runs: [Run] = []
+    }
+
+    /// Per-piece state behind `PieceMap`.
+    private struct PieceState {
+        var group: Character         // "v"ideo, "a"udio, "d"irect, "x" separate audio
+        var known: Int64?            // exact size once finished (or from its byte range)
+        var done = false
+        var got: Int64 = 0           // while downloading
+        var expected: Int64?
     }
 
     struct Output {
@@ -73,6 +95,7 @@ final class Engine: @unchecked Sendable {
     private var snap = Snapshot()
     private var keys: [URL: Data] = [:]
     private var lastSample = Date()
+    private var pieceStates: [PieceState] = []
 
     init(job: Job, workDir: URL, connections: Int) {
         self.job = job
@@ -93,7 +116,43 @@ final class Engine: @unchecked Sendable {
             let instant = Double(bytes) / dt
             snap.bytesPerSecond = snap.bytesPerSecond == 0 ? instant : snap.bytesPerSecond * 0.6 + instant * 0.4
         }
-        return snap
+        var s = snap
+        if !pieceStates.isEmpty { s.map = buildMap() }
+        return s
+    }
+
+    /// Sizes of pieces not downloaded yet are estimated from finished pieces of the same track.
+    private func buildMap() -> PieceMap {
+        var sums: [Character: (Int64, Int)] = [:]
+        for p in pieceStates { if let k = p.known { sums[p.group, default: (0, 0)].0 += k; sums[p.group, default: (0, 0)].1 += 1 } }
+        let overall = sums.values.reduce((Int64(0), 0)) { ($0.0 + $1.0, $0.1 + $1.1) }
+        func weight(_ p: PieceState) -> Double {
+            if let k = p.known { return Double(max(k, 1)) }
+            if let e = p.expected, e > 0 { return Double(e) }
+            if let (sum, n) = sums[p.group], n > 0 { return Double(sum) / Double(n) }
+            return overall.1 > 0 ? Double(overall.0) / Double(overall.1) : 1
+        }
+        let weights = pieceStates.map(weight)
+        let total = weights.reduce(0, +)
+        guard total > 0 else { return PieceMap() }
+        var map = PieceMap()
+        var x = 0.0
+        for (p, w) in zip(pieceStates, weights) {
+            let len = w / total
+            if p.done {
+                // Merge neighbouring finished pieces into one run.
+                if let last = map.runs.last, !last.active, abs(last.start + last.length - x) < 1e-9 {
+                    map.runs[map.runs.count - 1].length += len
+                } else {
+                    map.runs.append(.init(start: x, length: len, fill: 1, active: false))
+                }
+            } else if p.got > 0 || p.expected != nil {
+                let fill = p.expected.map { $0 > 0 ? min(1, Double(p.got) / Double($0)) : 0 } ?? 0
+                map.runs.append(.init(start: x, length: len, fill: fill, active: true))
+            }
+            x += len
+        }
+        return map
     }
 
     private func update(_ change: (inout Snapshot) -> Void) {
@@ -318,16 +377,22 @@ final class Engine: @unchecked Sendable {
 
     private func fetchAll(_ pieces: [Piece]) async throws {
         let fm = FileManager.default
-        var todo: [Piece] = []
+        var todo: [(Int, Piece)] = []
         var doneBytes: Int64 = 0
-        for p in pieces {
+        var states: [PieceState] = []
+        for (i, p) in pieces.enumerated() {
             let path = workDir.appendingPathComponent(p.name).path
+            var state = PieceState(group: p.name.first ?? "d", known: p.range.map { $0.upperBound - $0.lowerBound + 1 })
             if let size = (try? fm.attributesOfItem(atPath: path))?[.size] as? NSNumber {
                 doneBytes += size.int64Value
+                state.done = true
+                state.known = size.int64Value
             } else {
-                todo.append(p)
+                todo.append((i, p))
             }
+            states.append(state)
         }
+        withLock { pieceStates = states }
         let alreadyDone = pieces.count - todo.count
         update {
             $0.phase = .downloading
@@ -339,8 +404,8 @@ final class Engine: @unchecked Sendable {
         try await withThrowingTaskGroup(of: Int64.self) { group in
             var iterator = todo.makeIterator()
             for _ in 0 ..< connections {
-                guard let p = iterator.next() else { break }
-                group.addTask { try await self.fetchPiece(p) }
+                guard let (i, p) = iterator.next() else { break }
+                group.addTask { try await self.fetchPiece(p, index: i) }
             }
             while let bytes = try await group.next() {
                 update {
@@ -350,27 +415,37 @@ final class Engine: @unchecked Sendable {
                         $0.totalBytes = $0.bytesDone * Int64($0.piecesTotal) / Int64($0.piecesDone)
                     }
                 }
-                if let p = iterator.next() { group.addTask { try await self.fetchPiece(p) } }
+                if let (i, p) = iterator.next() { group.addTask { try await self.fetchPiece(p, index: i) } }
             }
         }
     }
 
-    private func fetchPiece(_ piece: Piece) async throws -> Int64 {
+    private func fetchPiece(_ piece: Piece, index: Int) async throws -> Int64 {
         let final = workDir.appendingPathComponent(piece.name)
         let tmp = workDir.appendingPathComponent(piece.name + ".part")
         var attempt = 0
         while true {
             try Task.checkCancellation()
             do {
-                try await fetcher.download(piece.url, range: piece.range, to: tmp)
+                try await fetcher.download(piece.url, range: piece.range, to: tmp) { [weak self] got, expected in
+                    self?.withLock {
+                        self?.pieceStates[index].got = got
+                        self?.pieceStates[index].expected = expected > 0 ? expected : nil
+                    }
+                }
                 if let key = piece.key {
                     let data = try HLS.decryptAES128(try Data(contentsOf: tmp), key: try await keyData(key.url), iv: key.iv ?? Data(count: 16))
                     try data.write(to: tmp)
                 }
                 try FileManager.default.moveItem(at: tmp, to: final)
-                let size = (try? FileManager.default.attributesOfItem(atPath: final.path))?[.size] as? NSNumber
-                return size?.int64Value ?? 0
+                let size = ((try? FileManager.default.attributesOfItem(atPath: final.path))?[.size] as? NSNumber)?.int64Value ?? 0
+                withLock {
+                    pieceStates[index].done = true
+                    pieceStates[index].known = size
+                }
+                return size
             } catch {
+                withLock { pieceStates[index].got = 0; pieceStates[index].expected = nil }
                 attempt += 1
                 if Task.isCancelled || error is CancellationError || attempt >= 5 { throw error }
                 try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)

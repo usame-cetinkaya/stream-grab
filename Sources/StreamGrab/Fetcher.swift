@@ -9,13 +9,18 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private var waiters: [Int: Waiter] = [:]
     private var received: Int64 = 0
 
+    /// Called as a download proceeds with (bytes written so far, bytes expected or -1).
+    typealias Progress = @Sendable (Int64, Int64) -> Void
+
     private final class Waiter {
         let destination: URL
         let expectsRange: Bool
         let continuation: CheckedContinuation<Int64, Error>
+        let progress: Progress?
         var result: Result<Int64, Error>?
-        init(_ destination: URL, _ expectsRange: Bool, _ continuation: CheckedContinuation<Int64, Error>) {
+        init(_ destination: URL, _ expectsRange: Bool, _ continuation: CheckedContinuation<Int64, Error>, _ progress: Progress?) {
             self.destination = destination; self.expectsRange = expectsRange; self.continuation = continuation
+            self.progress = progress
         }
     }
 
@@ -88,12 +93,12 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
 
     /// Downloads to `destination`, replacing it. Returns the number of bytes written.
     @discardableResult
-    func download(_ url: URL, range: ClosedRange<Int64>? = nil, to destination: URL) async throws -> Int64 {
+    func download(_ url: URL, range: ClosedRange<Int64>? = nil, to destination: URL, progress: Progress? = nil) async throws -> Int64 {
         let task = session.downloadTask(with: request(url, range: range))
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { cont in
                 lock.lock()
-                waiters[task.taskIdentifier] = Waiter(destination, range != nil, cont)
+                waiters[task.taskIdentifier] = Waiter(destination, range != nil, cont, progress)
                 lock.unlock()
                 task.resume()
             }
@@ -113,7 +118,11 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
                     totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        lock.lock(); received += bytesWritten; lock.unlock()
+        lock.lock()
+        received += bytesWritten
+        let progress = waiters[downloadTask.taskIdentifier]?.progress
+        lock.unlock()
+        progress?(totalBytesWritten, totalBytesExpectedToWrite)
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {

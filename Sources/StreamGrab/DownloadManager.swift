@@ -72,6 +72,8 @@ final class DownloadManager: ObservableObject {
     static let shared = DownloadManager()
 
     @Published private(set) var items: [DownloadItem] = []
+    /// Piece layout of downloads started in this session, for the segmented progress bar.
+    @Published private(set) var maps: [UUID: Engine.PieceMap] = [:]
     private var engines: [UUID: (engine: Engine, task: Task<Void, Never>)] = [:]
     private var timer: Timer?
     private var dirty = false
@@ -109,6 +111,8 @@ final class DownloadManager: ObservableObject {
         engines[id]?.task.cancel()
         engines[id] = nil
         set(id) { $0.status = .paused; $0.speed = 0; $0.stopClock() }
+        // Keep the finished parts on the bar; nothing is downloading any more.
+        maps[id]?.runs.removeAll { $0.active }
         schedule()
     }
 
@@ -121,6 +125,7 @@ final class DownloadManager: ObservableObject {
         engines[id]?.task.cancel()
         engines[id] = nil
         items.removeAll { $0.id == id }
+        maps[id] = nil
         try? FileManager.default.removeItem(at: workDir(id))
         changed()
         schedule()
@@ -191,6 +196,7 @@ final class DownloadManager: ObservableObject {
             }
         }
         if file != nil { try? FileManager.default.removeItem(at: workDir(id)) }
+        if file != nil { maps[id] = nil } else { maps[id]?.runs.removeAll { $0.active } }
         if file != nil { NSApp.requestUserAttention(.informationalRequest) }
         schedule()
     }
@@ -209,6 +215,7 @@ final class DownloadManager: ObservableObject {
             item.totalBytes = s.totalBytes
             item.speed = s.phase == .downloading ? s.bytesPerSecond : 0
         }
+        if let map = s.map, s.phase == .downloading, maps[id] != map { maps[id] = map }
     }
 
     private func set(_ id: UUID, _ change: (inout DownloadItem) -> Void) {
