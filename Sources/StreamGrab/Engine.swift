@@ -49,7 +49,12 @@ final class Engine: @unchecked Sendable {
         var totalBytes: Int64?   // exact for direct downloads, estimated for streams
         var bytesPerSecond: Double = 0
         var map: PieceMap?
+        var connections = 1
+        /// The server answered HTTP 429 and the connection count was lowered.
+        var rateLimited = false
     }
+
+    static let maxConnections = 16
 
     /// The file laid out as pieces, for the progress bar: finished runs and the pieces
     /// each connection is fetching right now (positions are fractions of the whole file).
@@ -89,7 +94,11 @@ final class Engine: @unchecked Sendable {
 
     let job: Job
     let workDir: URL
-    private let connections: Int
+    private var limit: Int          // connections allowed right now; changes with 429s and the user's − / +
+    private var rateLimited = false
+    /// Bumped whenever `limit` changes. A 429 only lowers the limit if its request was sent
+    /// under the current limit; requests sent in the same overloaded burst don't count again.
+    private var epoch = 0
     private let fetcher: Fetcher
     private let lock = NSLock()
     private var snap = Snapshot()
@@ -100,8 +109,8 @@ final class Engine: @unchecked Sendable {
     init(job: Job, workDir: URL, connections: Int) {
         self.job = job
         self.workDir = workDir
-        self.connections = max(1, connections)
-        fetcher = Fetcher(headers: job.headers, connections: connections)
+        limit = min(max(1, connections), Self.maxConnections)
+        fetcher = Fetcher(headers: job.headers)
     }
 
     deinit { fetcher.invalidate() }
@@ -118,6 +127,8 @@ final class Engine: @unchecked Sendable {
         }
         var s = snap
         if !pieceStates.isEmpty { s.map = buildMap() }
+        s.connections = limit
+        s.rateLimited = rateLimited
         return s
     }
 
@@ -153,6 +164,15 @@ final class Engine: @unchecked Sendable {
             x += len
         }
         return map
+    }
+
+    /// The user's − / + on a download. Takes effect for the next pieces (running ones finish first).
+    func setConnections(_ n: Int) {
+        withLock {
+            limit = min(max(1, n), Self.maxConnections)
+            rateLimited = false
+            epoch += 1
+        }
     }
 
     private func update(_ change: (inout Snapshot) -> Void) {
@@ -401,21 +421,64 @@ final class Engine: @unchecked Sendable {
             $0.bytesDone = doneBytes
         }
 
-        try await withThrowingTaskGroup(of: Int64.self) { group in
-            var iterator = todo.makeIterator()
-            for _ in 0 ..< connections {
-                guard let (i, p) = iterator.next() else { break }
-                group.addTask { try await self.fetchPiece(p, index: i) }
-            }
-            while let bytes = try await group.next() {
-                update {
-                    $0.piecesDone += 1
-                    $0.bytesDone += bytes
-                    if job.kind != .direct, $0.piecesDone > 0 {
-                        $0.totalBytes = $0.bytesDone * Int64($0.piecesTotal) / Int64($0.piecesDone)
+        // Pieces wait in `queue`; a piece the server refused with HTTP 429 goes back to the front
+        // with a not-before time, and the number running at once follows `limit`, which drops by
+        // one per 429 burst (down to 1) and follows the user's − / +.
+        enum Event { case done(Int64), refused(Int, Piece, TimeInterval?, epoch: Int), tick }
+        var queue = todo
+        var notBefore: [Int: Date] = [:]
+        var refusals: [Int: Int] = [:]
+        var running = 0
+
+        try await withThrowingTaskGroup(of: Event.self) { group in
+            // A heartbeat, so a raised limit or an expired wait is noticed without a piece finishing.
+            group.addTask { try await Task.sleep(nanoseconds: 400_000_000); return .tick }
+            while true {
+                let now = Date()
+                while running < withLock({ limit }),
+                      let pos = queue.firstIndex(where: { (notBefore[$0.0] ?? .distantPast) <= now }) {
+                    let (i, p) = queue.remove(at: pos)
+                    running += 1
+                    let sentIn = withLock { epoch }
+                    group.addTask {
+                        do { return .done(try await self.fetchPiece(p, index: i)) }
+                        catch let e as HTTPStatusError where e.status == 429 { return .refused(i, p, e.retryAfter, epoch: sentIn) }
                     }
                 }
-                if let (i, p) = iterator.next() { group.addTask { try await self.fetchPiece(p, index: i) } }
+                if running == 0 && queue.isEmpty { group.cancelAll(); break }
+                guard let event = try await group.next() else { break }
+                switch event {
+                case .tick:
+                    group.addTask { try await Task.sleep(nanoseconds: 400_000_000); return .tick }
+                case let .done(bytes):
+                    running -= 1
+                    update {
+                        $0.piecesDone += 1
+                        $0.bytesDone += bytes
+                        if job.kind != .direct, $0.piecesDone > 0 {
+                            $0.totalBytes = $0.bytesDone * Int64($0.piecesTotal) / Int64($0.piecesDone)
+                        }
+                    }
+                case let .refused(i, p, retryAfter, sentIn):
+                    running -= 1
+                    let n = (refusals[i] ?? 0) + 1
+                    refusals[i] = n
+                    let atOne = withLock { () -> Bool in
+                        let wasOne = limit == 1
+                        if sentIn == epoch {
+                            limit = max(1, limit - 1)
+                            epoch += 1
+                        }
+                        rateLimited = true
+                        return wasOne
+                    }
+                    // Still refused with a single connection, again and again: give up.
+                    if atOne && n > 12 {
+                        throw HTTPStatusError(status: 429, retryAfter: nil, name: p.url.lastPathComponent)
+                    }
+                    notBefore[i] = Date().addingTimeInterval(min(retryAfter ?? min(pow(2, Double(n - 1)), 30), 120))
+                    queue.insert((i, p), at: 0)
+                }
             }
         }
     }
@@ -446,6 +509,8 @@ final class Engine: @unchecked Sendable {
                 return size
             } catch {
                 withLock { pieceStates[index].got = 0; pieceStates[index].expected = nil }
+                // "Too many requests": hand the piece back to the scheduler, which slows down.
+                if let e = error as? HTTPStatusError, e.status == 429 { throw e }
                 attempt += 1
                 if Task.isCancelled || error is CancellationError || attempt >= 5 { throw error }
                 try await Task.sleep(nanoseconds: UInt64(attempt) * 1_000_000_000)

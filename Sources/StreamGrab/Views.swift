@@ -78,7 +78,11 @@ struct DownloadRow: View {
                         ProgressView().progressViewStyle(.linear)
                     }
                 }
-                Text(detail).font(.caption).foregroundStyle(item.status == .failed ? .red : .secondary).lineLimit(2)
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text(detail).font(.caption).foregroundStyle(item.status == .failed ? .red : .secondary).lineLimit(2)
+                    Spacer(minLength: 4)
+                    if showsConnections { connectionControl }
+                }
                 if let note = item.note {
                     Label(note, systemImage: "speaker.slash")
                         .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
@@ -100,6 +104,35 @@ struct DownloadRow: View {
             Divider()
             Button("Remove from List") { manager.remove(item.id) }
         }
+    }
+
+    /// Only where more than one connection can help: not finished, and more than one piece.
+    private var showsConnections: Bool {
+        [.downloading, .queued, .paused].contains(item.status) && (item.piecesTotal != 1)
+    }
+
+    private var connectionControl: some View {
+        let n = manager.connections(of: item)
+        return HStack(spacing: 2) {
+            if item.rateLimited == true {
+                Image(systemName: "tortoise.fill")
+                    .foregroundStyle(.orange)
+                    .help("The server answered “Too many requests” (HTTP 429), so StreamGrab lowered the connections for this download.")
+            }
+            Button { manager.setConnections(item.id, n - 1) } label: { Image(systemName: "minus") }
+                .disabled(n <= 1)
+                .help("Fewer connections")
+            Text("\(n) \(n == 1 ? "connection" : "connections")")
+                .monospacedDigit()
+                .frame(minWidth: 82)
+            Button { manager.setConnections(item.id, n + 1) } label: { Image(systemName: "plus") }
+                .disabled(n >= Engine.maxConnections)
+                .help("More connections")
+        }
+        .font(.caption)
+        .foregroundStyle(item.rateLimited == true ? .orange : .secondary)
+        .buttonStyle(.borderless)
+        .controlSize(.small)
     }
 
     @ViewBuilder private var buttons: some View {

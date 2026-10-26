@@ -20,6 +20,10 @@ struct DownloadItem: Identifiable, Codable {
     /// saved by older versions still load.
     var elapsed: Double?
     var runningSince: Date?
+    /// This download's own connection count (nil: use the Settings default).
+    var connections: Int?
+    /// The server answered "Too many requests" (HTTP 429), so connections were lowered.
+    var rateLimited: Bool?
 
     var isActive: Bool { status == .downloading || status == .merging }
 
@@ -137,6 +141,15 @@ final class DownloadManager: ObservableObject {
         changed()
     }
 
+    /// The − / + on a download row.
+    func setConnections(_ id: UUID, _ n: Int) {
+        let n = min(max(1, n), Engine.maxConnections)
+        set(id) { $0.connections = n; $0.rateLimited = nil }
+        engines[id]?.engine.setConnections(n)
+    }
+
+    func connections(of item: DownloadItem) -> Int { item.connections ?? settings.connections }
+
     func reveal(_ id: UUID) {
         guard let file = items.first(where: { $0.id == id })?.file else { return }
         NSWorkspace.shared.activateFileViewerSelecting([file])
@@ -160,7 +173,7 @@ final class DownloadManager: ObservableObject {
 
     private func start(_ item: DownloadItem) {
         let id = item.id
-        let engine = Engine(job: item.job, workDir: workDir(id), connections: settings.connections)
+        let engine = Engine(job: item.job, workDir: workDir(id), connections: item.connections ?? settings.connections)
         let folder = settings.folder
         set(id) { $0.status = .downloading; $0.error = nil; $0.startClock() }
         let task = Task.detached { [engine] in
@@ -208,6 +221,8 @@ final class DownloadManager: ObservableObject {
 
     private func apply(_ s: Engine.Snapshot, to id: UUID) {
         set(id) { item in
+            item.connections = s.connections
+            item.rateLimited = s.rateLimited ? true : nil
             item.status = s.phase == .merging ? .merging : .downloading
             item.piecesDone = s.piecesDone
             item.piecesTotal = s.piecesTotal

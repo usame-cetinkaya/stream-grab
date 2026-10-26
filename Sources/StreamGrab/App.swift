@@ -106,6 +106,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return ["ok": true]
         case "ping":
             return ["ok": true]
+        #if DEBUG
+        case "debugConnections": // tests press a download's − / + without the UI
+            guard let item = DownloadManager.shared.items.first, let n = message["n"] as? Int else { return ["ok": false] }
+            DownloadManager.shared.setConnections(item.id, n)
+            return ["ok": true]
+        #endif
         default:
             return ["ok": false, "error": "Unknown request"]
         }

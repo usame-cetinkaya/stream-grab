@@ -30,7 +30,7 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         "if-none-match", "if-modified-since", "upgrade-insecure-requests", "priority",
     ]
 
-    init(headers: [String: String], connections: Int = 8) {
+    init(headers: [String: String], connections: Int = Engine.maxConnections) {
         self.headers = headers.filter { k, _ in
             let k = k.lowercased()
             return !Self.skipped.contains(k) && !k.hasPrefix("sec-") && !k.hasPrefix(":")
@@ -108,10 +108,10 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     }
 
     static func check(_ response: URLResponse, url: URL) throws {
-        guard let http = response as? HTTPURLResponse else { return }
-        guard (200 ..< 300).contains(http.statusCode) else {
-            throw GrabError("Server answered HTTP \(http.statusCode) for \(url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent).")
-        }
+        guard let http = response as? HTTPURLResponse, !(200 ..< 300).contains(http.statusCode) else { return }
+        throw HTTPStatusError(status: http.statusCode,
+                              retryAfter: http.value(forHTTPHeaderField: "Retry-After").flatMap(HTTPStatusError.parseRetryAfter),
+                              name: url.lastPathComponent.isEmpty ? url.absoluteString : url.lastPathComponent)
     }
 
     // MARK: URLSessionDownloadDelegate
@@ -148,5 +148,26 @@ final class Fetcher: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
         guard let w else { return }
         if let error { w.continuation.resume(throwing: error) }
         else { w.continuation.resume(with: w.result ?? .failure(GrabError("Download finished without data."))) }
+    }
+}
+
+struct HTTPStatusError: LocalizedError {
+    let status: Int
+    /// From the Retry-After header: how long the server wants us to wait.
+    let retryAfter: TimeInterval?
+    let name: String
+
+    var errorDescription: String? {
+        status == 429 ? "The server kept refusing with “Too many requests” (HTTP 429) for \(name), even over one connection."
+            : "Server answered HTTP \(status) for \(name)."
+    }
+
+    /// Retry-After is either a number of seconds or an HTTP date.
+    static func parseRetryAfter(_ value: String) -> TimeInterval? {
+        if let s = TimeInterval(value.trimmingCharacters(in: .whitespaces)) { return max(0, s) }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        return f.date(from: value).map { max(0, $0.timeIntervalSinceNow) }
     }
 }

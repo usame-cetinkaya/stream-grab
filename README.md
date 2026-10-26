@@ -17,7 +17,11 @@ the whole stream.
 - The button only appears while the StreamGrab app is open (the toolbar popup still lists what it found).
 - Replays the page's own request headers (Referer, Origin, Cookie, User-Agent), so CDNs that
   check them still serve the stream.
-- Pause, resume (even after quitting the app), retry, and a list of finished downloads.
+- Each download has its own − / + for connections (1–16), applied while it runs. If a server answers
+  HTTP 429 ("too many requests"), that download drops a connection per refusal, down to 1, and retries the
+  refused piece after the server's Retry-After wait.
+- The progress bar shows finished parts and the piece each connection is fetching right now.
+- Pause, resume (even after quitting the app), retry, and a list of finished downloads with how long they took.
 - Paste a link into the app to download it without the browser.
 
 DRM-protected services (Netflix, Disney+, Prime Video, Spotify…) and live streams are not supported.
