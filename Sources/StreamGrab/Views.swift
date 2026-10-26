@@ -51,9 +51,28 @@ struct MainView: View {
     }
 }
 
+/// A whole number of megabytes edited as text, applied on every keystroke (digits only), so a
+/// button pressed right after typing sees the new value.
+func megabytes(_ value: Binding<Int>) -> Binding<String> {
+    Binding(get: { String(value.wrappedValue) },
+            set: { text in
+                let digits = text.filter(\.isNumber).prefix(7)
+                if let n = Int(digits) { value.wrappedValue = max(1, n) }
+            })
+}
+
+/// The Convert… panel's choices for one download.
+final class ConvertForm: ObservableObject {
+    @Published var shown = false
+    @Published var height = Settings.shared.convertHeight
+    @Published var maxMB = Settings.shared.convertMaxMB
+    @Published var format = Settings.shared.convertFormat
+}
+
 struct DownloadRow: View {
     let item: DownloadItem
     @ObservedObject var manager = DownloadManager.shared
+    @StateObject private var form = ConvertForm()
 
     var body: some View {
         HStack(spacing: 12) {
@@ -95,6 +114,7 @@ struct DownloadRow: View {
                     Label(note, systemImage: "speaker.slash")
                         .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                 }
+                ForEach(item.conversions ?? []) { c in ConversionLine(item: item.id, conversion: c) }
             }
             Spacer(minLength: 8)
             buttons
@@ -158,6 +178,21 @@ struct DownloadRow: View {
             case .completed:
                 iconButton("play.rectangle", "Open") { manager.open(item.id) }
                 iconButton("magnifyingglass", "Show in Finder") { manager.reveal(item.id) }
+                if Paths.ffmpeg != nil {
+                    iconButton("arrow.triangle.2.circlepath", "Convert…") {
+                        // Start from the global choices each time the panel opens.
+                        form.height = Settings.shared.convertHeight
+                        form.maxMB = Settings.shared.convertMaxMB
+                        form.format = Settings.shared.convertFormat
+                        form.shown = true
+                    }
+                    .popover(isPresented: $form.shown, arrowEdge: .bottom) {
+                        ConvertPanel(form: form) {
+                            form.shown = false
+                            manager.convert(item.id, format: form.format, height: form.height, maxMB: form.maxMB)
+                        }
+                    }
+                }
             case .merging:
                 EmptyView()
             }
@@ -245,6 +280,103 @@ struct DownloadRow: View {
             }
             return parts.joined(separator: " · ")
         }
+    }
+}
+
+/// Resolution, size and format for converting one download.
+struct ConvertPanel: View {
+    @ObservedObject var form: ConvertForm
+    let start: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Convert a Copy").font(.headline)
+            Form {
+                Picker("Resolution", selection: $form.height) {
+                    ForEach(Settings.convertHeights, id: \.self) { Text("\($0)p").tag($0) }
+                }
+                LabeledContent("Maximum size") {
+                    HStack(spacing: 6) {
+                        TextField("Maximum size", text: megabytes($form.maxMB))
+                            .labelsHidden().multilineTextAlignment(.trailing).frame(width: 80)
+                        Text("MB").foregroundStyle(.secondary)
+                    }
+                }
+                Picker("Format", selection: $form.format) {
+                    ForEach(ConversionFormat.available, id: \.self) { Text($0.label).tag($0) }
+                }
+            }
+            Text("The original is kept. These choices apply to this download only.")
+                .font(.caption).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Convert", action: start)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(form.maxMB < 1)
+            }
+        }
+        .padding(16)
+        .frame(width: 380)
+    }
+}
+
+/// One converted copy's status under a finished download.
+struct ConversionLine: View {
+    let item: UUID
+    let conversion: Conversion
+    @ObservedObject var manager = DownloadManager.shared
+
+    var body: some View {
+        let c = conversion
+        let target = "\(c.label), up to \(c.maxMB) MB"
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                switch c.state {
+                case .waiting:
+                    Label("Waiting to convert to \(target)", systemImage: "clock").foregroundStyle(.secondary)
+                case .running:
+                    let pct = Int((c.progress ?? 0) * 100)
+                    Label("\(c.stage ?? "Converting") to \(target) · \(pct)%", systemImage: "gearshape.2").foregroundStyle(.secondary)
+                case .done:
+                    let size = c.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? ""
+                    let how = switch c.mode {
+                    case .copy: "original quality, copied"
+                    case .quality: "original quality"
+                    case .fitted: "sized to fit \(c.maxMB) MB"
+                    case nil: ""
+                    }
+                    let took = c.elapsed.map { " · took \(DownloadRow.duration($0))" } ?? ""
+                    Label("\(c.label) copy: \(size) (\(how))\(took)", systemImage: "checkmark.circle").foregroundStyle(.green)
+                        .help(c.file?.lastPathComponent ?? "")
+                case .failed:
+                    Label("\(c.label): \(c.error ?? "Conversion failed")", systemImage: "exclamationmark.triangle").foregroundStyle(.red)
+                }
+                Spacer(minLength: 4)
+                Group {
+                    switch c.state {
+                    case .waiting, .running:
+                        Button { manager.cancelConversion(item, c.id) } label: { Image(systemName: "xmark.circle") }
+                            .help("Cancel this conversion (the original is kept)")
+                    case .done:
+                        Button { manager.openConverted(item, c.id) } label: { Image(systemName: "play.rectangle") }
+                            .help("Open the converted copy")
+                        Button { manager.revealConverted(item, c.id) } label: { Image(systemName: "magnifyingglass") }
+                            .help("Show the converted copy in Finder")
+                        Button { manager.dismissConversion(item, c.id) } label: { Image(systemName: "xmark") }
+                            .help("Remove from the list (the file is kept)")
+                    case .failed:
+                        Button { manager.retryConversion(item, c.id) } label: { Image(systemName: "arrow.clockwise") }
+                            .help("Try converting again")
+                        Button { manager.dismissConversion(item, c.id) } label: { Image(systemName: "xmark") }
+                            .help("Remove from the list")
+                    }
+                }
+                .buttonStyle(.borderless)
+            }
+            if c.state == .running { ProgressView(value: c.progress ?? 0).controlSize(.small) }
+        }
+        .font(.caption)
+        .lineLimit(2)
     }
 }
 
@@ -343,6 +475,36 @@ struct SettingsView: View {
                 Text("Downloads")
             } footer: {
                 Text("More connections can speed up large video files on servers that allow it. Downloads that fail because of a network or server problem are retried up to 8 times, waiting longer each time.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
+                Toggle("Convert finished downloads", isOn: $settings.convert)
+                    .disabled(Paths.ffmpeg == nil)
+                Group {
+                    Picker("Resolution", selection: $settings.convertHeight) {
+                        ForEach(Settings.convertHeights, id: \.self) { Text("\($0)p").tag($0) }
+                    }
+                    LabeledContent("Maximum size") {
+                        HStack(spacing: 6) {
+                            TextField("Maximum size", text: megabytes($settings.convertMaxMB))
+                                .labelsHidden()
+                                .multilineTextAlignment(.trailing)
+                                .frame(width: 80)
+                            Text("MB").foregroundStyle(.secondary)
+                        }
+                    }
+                    Picker("Format", selection: $settings.convertFormat) {
+                        ForEach(ConversionFormat.available, id: \.self) { Text($0.label).tag($0) }
+                    }
+                }
+                .disabled(!settings.convert || Paths.ffmpeg == nil)
+            } header: {
+                Text("After Download")
+            } footer: {
+                Text(Paths.ffmpeg == nil
+                     ? "Needs ffmpeg (see below)."
+                     : "When on, every finished download also gets a converted copy next to the original, scaled down to the resolution (never up). If that copy fits the maximum size at the original's quality it's kept as is; only if it doesn't is the quality lowered to fit. With it off, or to make more copies, use the Convert… button on a finished download.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

@@ -47,6 +47,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
         #if DEBUG
         if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT"] { snapshot(window, to: path) }
+        if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT_CONVERT"] {
+            let w = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
+            w.contentView = NSHostingView(rootView: ConvertPanel(form: ConvertForm()) {})
+            w.setContentSize(w.contentView!.fittingSize)
+            w.orderFront(nil)
+            snapshot(w, to: path)
+        }
         if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT_SETTINGS"] {
             showSettings()
             snapshot(settingsWindow!, to: path)
@@ -110,6 +117,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case "debugConnections": // tests press a download's − / + without the UI
             guard let item = DownloadManager.shared.items.first, let n = message["n"] as? Int else { return ["ok": false] }
             DownloadManager.shared.setConnections(item.id, n)
+            return ["ok": true]
+        case "debugConvert": // tests use a download's Convert… panel without the UI
+            guard let item = DownloadManager.shared.items.first, let f = (message["format"] as? String).flatMap(ConversionFormat.init(rawValue:)),
+                  let h = message["height"] as? Int, let mb = message["maxMB"] as? Int else { return ["ok": false] }
+            DownloadManager.shared.convert(item.id, format: f, height: h, maxMB: mb)
             return ["ok": true]
         case "debugRemove": // tests press a download's × without the UI
             guard let item = DownloadManager.shared.items.first else { return ["ok": false] }

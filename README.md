@@ -25,6 +25,15 @@ the whole stream.
   are retried automatically: up to 8 times, waiting 5 s, 15 s, 30 s, 1 min, 2 min, 5 min, then 10 min (or the
   server's Retry-After), with a countdown in the list. A try that made progress starts the count over, and
   waiting retries go right away when the Mac gets back online. Permanent errors (404, DRM…) aren't retried.
+- **Conversion after download** (needs ffmpeg): pick a resolution (1080p–240p), a maximum size in MB and a
+  format (MP4 H.264/H.265, hardware H.264/H.265, AV1, WebM VP9). The original is always kept and the copy is
+  saved next to it. Each copy is made with as little quality loss as possible:
+  1. same codec and no scaling needed → streams copied unchanged;
+  2. otherwise scaled down (never up) at the original's quality, kept if it fits under the limit;
+  3. only if that's too big, encoded at the bitrate that fits (two passes for H.264/H.265/VP9), measured,
+     and shrunk again if it overshoots. A copy is never inflated toward the limit.
+  Turn it on in Settings to convert every finished download, or use **Convert…** on any finished download
+  to make a copy with its own settings, as many times as you like. Copies are made one at a time.
 - Pause, resume (even after quitting the app), retry, and a list of finished downloads with how long they took.
 - Paste a link into the app to download it without the browser.
 
@@ -73,6 +82,7 @@ and separate audio tracks are saved next to the video instead of inside it.
 | `Sources/StreamGrab/Engine.swift` | Piece downloads, resume, merge, ffmpeg remux |
 | `Sources/StreamGrab/Fetcher.swift` | URLSession wrapper that replays browser headers |
 | `Sources/StreamGrab/DownloadManager.swift` | Queue, pause/resume, automatic retries, persistence, settings |
+| `Sources/StreamGrab/Converter.swift` | Post-download conversion: copy / full quality / fit-to-size with ffmpeg |
 | `Sources/StreamGrab/Retry.swift` | Which errors are retried, back-off delays, back-online detection |
 | `Sources/StreamGrab/Views.swift` | SwiftUI download list, setup guide, settings |
 | `Sources/StreamGrab/Setup.swift` | Installs host manifests and the extension folder on launch |

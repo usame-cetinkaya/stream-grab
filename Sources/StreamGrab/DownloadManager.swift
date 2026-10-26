@@ -1,6 +1,26 @@
 import AppKit
 import Combine
 
+/// One converted copy of a finished download.
+struct Conversion: Codable, Identifiable {
+    enum State: String, Codable { case waiting, running, done, failed }
+    var id = UUID()
+    var state: State = .waiting
+    var format: ConversionFormat
+    var height: Int
+    var maxMB: Int
+    var progress: Double?
+    var stage: String?
+    var mode: Converter.Mode?
+    var file: URL?
+    var size: Int64?
+    var error: String?
+    var elapsed: Double?
+
+    var isPending: Bool { state == .waiting || state == .running }
+    var label: String { "\(height)p · \(format.short)" }
+}
+
 struct DownloadItem: Identifiable, Codable {
     enum Status: String, Codable { case queued, downloading, merging, paused, completed, failed }
 
@@ -27,6 +47,9 @@ struct DownloadItem: Identifiable, Codable {
     /// Automatic retries after a temporary failure: how many so far, and when the next one is due.
     var autoRetries: Int?
     var retryAt: Date?
+    /// Converted copies, automatic or from the Convert… button, oldest first.
+    var conversions: [Conversion]?
+    var hasPendingConversion: Bool { conversions?.contains(where: \.isPending) == true }
 
     var isActive: Bool { status == .downloading || status == .merging }
 
@@ -64,6 +87,23 @@ final class Settings: ObservableObject {
     @Published var autoRetry: Bool {
         didSet { d.set(autoRetry, forKey: "autoRetry") }
     }
+    // Post-download conversion.
+    @Published var convert: Bool {
+        didSet { d.set(convert, forKey: "convert") }
+    }
+    @Published var convertHeight: Int {
+        didSet { d.set(convertHeight, forKey: "convertHeight") }
+    }
+    @Published var convertMaxMB: Int {
+        didSet {
+            if convertMaxMB < 1 { convertMaxMB = 1 }
+            d.set(convertMaxMB, forKey: "convertMaxMB")
+        }
+    }
+    @Published var convertFormat: ConversionFormat {
+        didSet { d.set(convertFormat.rawValue, forKey: "convertFormat") }
+    }
+    static let convertHeights = [1080, 720, 480, 360, 240]
 
     static let connectionChoices = [1, 2, 4, 8, 12, 16]
 
@@ -75,6 +115,10 @@ final class Settings: ObservableObject {
         connections = Self.connectionChoices.min { abs($0 - saved) < abs($1 - saved) } ?? 8
         simultaneous = d.object(forKey: "simultaneous") as? Int ?? 3
         autoRetry = d.object(forKey: "autoRetry") as? Bool ?? true
+        convert = d.object(forKey: "convert") as? Bool ?? false
+        convertHeight = d.object(forKey: "convertHeight") as? Int ?? 720
+        convertMaxMB = max(1, d.object(forKey: "convertMaxMB") as? Int ?? 800)
+        convertFormat = d.string(forKey: "convertFormat").flatMap(ConversionFormat.init(rawValue:)) ?? .h264
     }
 }
 
@@ -99,11 +143,17 @@ final class DownloadManager: ObservableObject {
             items = saved.map { item in
                 var item = item
                 if item.isActive || item.status == .queued { item.status = .paused }
+                for i in item.conversions?.indices ?? 0 ..< 0 where item.conversions?[i].state == .running {
+                    item.conversions?[i].state = .waiting
+                    item.conversions?[i].progress = nil
+                }
                 item.runningSince = nil // time before an unexpected exit can't be known
                 item.speed = 0
                 return item
             }
         }
+        // Conversions interrupted by quitting pick up again.
+        DispatchQueue.main.async { DownloadManager.shared.scheduleConversion() }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             Task { @MainActor in DownloadManager.shared.tick() }
         }
@@ -158,6 +208,7 @@ final class DownloadManager: ObservableObject {
     /// Cancels (if running), forgets the download, and deletes its pieces. A finished video in the
     /// download folder is kept: removing a finished item only clears it from the list.
     func remove(_ id: UUID) {
+        if let c = converting, c.item == id { c.converter.cancel() }
         let task = engines[id]?.task
         task?.cancel()
         engines[id] = nil
@@ -176,8 +227,146 @@ final class DownloadManager: ObservableObject {
 
     func clearFinished() {
         for item in items where item.status == .completed { try? FileManager.default.removeItem(at: workDir(item.id)) }
-        items.removeAll { $0.status == .completed }
+        items.removeAll { $0.status == .completed && !$0.hasPendingConversion }
         changed()
+    }
+
+    // MARK: Conversion
+
+    private var converting: (item: UUID, conversion: UUID, converter: Converter, task: Task<Void, Never>)?
+
+    private func updateConversion(_ item: UUID, _ conversion: UUID, _ change: (inout Conversion) -> Void) {
+        set(item) { i in
+            guard let k = i.conversions?.firstIndex(where: { $0.id == conversion }) else { return }
+            change(&i.conversions![k])
+        }
+    }
+
+    /// Converts one copy at a time (encoding already uses every core), oldest request first.
+    private func scheduleConversion() {
+        guard converting == nil, let ffmpeg = Paths.ffmpeg else { return }
+        let next = items.reversed().lazy.compactMap { item -> (DownloadItem, Conversion)? in
+            guard item.status == .completed, let c = item.conversions?.first(where: { $0.state == .waiting }) else { return nil }
+            return (item, c)
+        }.first
+        guard let (item, c) = next, let input = item.file else { return }
+        let itemID = item.id, convID = c.id
+        guard FileManager.default.fileExists(atPath: input.path) else {
+            updateConversion(itemID, convID) { $0.state = .failed; $0.error = "The downloaded file is no longer there." }
+            return scheduleConversion()
+        }
+        let output = Self.uniqueURL(input.deletingLastPathComponent()
+            .appendingPathComponent("\(input.deletingPathExtension().lastPathComponent) (\(c.height)p \(c.format.short))")
+            .appendingPathExtension(c.format.fileExtension))
+        let converter = Converter(ffmpeg: ffmpeg)
+        let scratch = Paths.work.appendingPathComponent("\(convID.uuidString)-convert", isDirectory: true)
+        let started = Date()
+        updateConversion(itemID, convID) { $0.state = .running; $0.progress = 0; $0.error = nil; $0.stage = nil }
+        let task = Task.detached {
+            var failure: String?
+            var mode: Converter.Mode?
+            do {
+                mode = try await converter.convert(input: input, output: output, format: c.format, height: c.height,
+                                                   maxBytes: Int64(c.maxMB) * 1_000_000, workDir: scratch) { p in
+                    Task { @MainActor in DownloadManager.shared.conversionProgress(itemID, convID, p) }
+                }
+            } catch is CancellationError {
+            } catch {
+                failure = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+            try? FileManager.default.removeItem(at: scratch)
+            let elapsed = Date().timeIntervalSince(started)
+            let cancelled = converter.isCancelled
+            let ok = !cancelled && failure == nil
+            if !ok { try? FileManager.default.removeItem(at: output) }
+            let (result, how) = (failure, mode)
+            await MainActor.run {
+                DownloadManager.shared.conversionFinished(itemID, convID, output: ok ? output : nil, mode: how,
+                                                          error: cancelled ? nil : result, elapsed: elapsed)
+            }
+        }
+        converting = (itemID, convID, converter, task)
+    }
+
+    private func conversionProgress(_ item: UUID, _ conversion: UUID, _ p: Converter.Progress) {
+        guard converting?.conversion == conversion,
+              let i = items.firstIndex(where: { $0.id == item }),
+              let k = items[i].conversions?.firstIndex(where: { $0.id == conversion }) else { return }
+        items[i].conversions?[k].progress = p.fraction
+        items[i].conversions?[k].stage = p.stage
+    }
+
+    private func conversionFinished(_ item: UUID, _ conversion: UUID, output: URL?, mode: Converter.Mode?,
+                                    error: String?, elapsed: Double) {
+        guard converting?.conversion == conversion else { return }
+        converting = nil
+        if output == nil && error == nil {
+            set(item) { $0.conversions?.removeAll { $0.id == conversion } } // cancelled
+        } else {
+            updateConversion(item, conversion) { c in
+                c.progress = nil
+                c.stage = nil
+                if let output {
+                    c.state = .done
+                    c.file = output
+                    c.mode = mode
+                    c.size = ((try? FileManager.default.attributesOfItem(atPath: output.path))?[.size] as? NSNumber)?.int64Value
+                    c.elapsed = elapsed
+                } else {
+                    c.state = .failed
+                    c.error = error
+                }
+            }
+        }
+        scheduleConversion()
+    }
+
+    /// The Convert… button on a finished download: its own settings, whatever the global ones are.
+    /// Works any number of times; every copy is kept and listed.
+    func convert(_ id: UUID, format: ConversionFormat, height: Int, maxMB: Int) {
+        set(id) { $0.conversions = ($0.conversions ?? []) + [Conversion(format: format, height: height, maxMB: max(1, maxMB))] }
+        scheduleConversion()
+    }
+
+    func cancelConversion(_ item: UUID, _ conversion: UUID) {
+        if let c = converting, c.conversion == conversion {
+            c.converter.cancel()
+        } else {
+            set(item) { $0.conversions?.removeAll { $0.id == conversion } }
+        }
+    }
+
+    /// Removes a finished or failed copy's line; a converted file stays on disk.
+    func dismissConversion(_ item: UUID, _ conversion: UUID) {
+        set(item) { $0.conversions?.removeAll { $0.id == conversion } }
+    }
+
+    func retryConversion(_ item: UUID, _ conversion: UUID) {
+        updateConversion(item, conversion) { $0.state = .waiting; $0.error = nil; $0.progress = nil }
+        scheduleConversion()
+    }
+
+    private func convertedFile(_ item: UUID, _ conversion: UUID) -> URL? {
+        items.first { $0.id == item }?.conversions?.first { $0.id == conversion }?.file
+    }
+
+    func revealConverted(_ item: UUID, _ conversion: UUID) {
+        if let f = convertedFile(item, conversion) { NSWorkspace.shared.activateFileViewerSelecting([f]) }
+    }
+
+    func openConverted(_ item: UUID, _ conversion: UUID) {
+        if let f = convertedFile(item, conversion) { NSWorkspace.shared.open(f) }
+    }
+
+    private static func uniqueURL(_ url: URL) -> URL {
+        var target = url
+        var n = 2
+        let base = url.deletingPathExtension().lastPathComponent
+        while FileManager.default.fileExists(atPath: target.path) {
+            target = url.deletingLastPathComponent().appendingPathComponent("\(base) (\(n))").appendingPathExtension(url.pathExtension)
+            n += 1
+        }
+        return target
     }
 
     /// The − / + on a download row.
@@ -268,6 +457,9 @@ final class DownloadManager: ObservableObject {
         if file != nil { try? FileManager.default.removeItem(at: workDir(id)) }
         if file != nil { maps[id] = nil } else { maps[id]?.runs.removeAll { $0.active } }
         if file != nil { NSApp.requestUserAttention(.informationalRequest) }
+        if file != nil, settings.convert, Paths.ffmpeg != nil {
+            convert(id, format: settings.convertFormat, height: settings.convertHeight, maxMB: settings.convertMaxMB)
+        }
         schedule()
     }
 
