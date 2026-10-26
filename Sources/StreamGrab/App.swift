@@ -18,6 +18,7 @@ enum Entry {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow!
+    private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Setup.run()
@@ -45,15 +46,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
         #if DEBUG
-        if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT"] { snapshot(to: path) }
+        if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT"] { snapshot(window, to: path) }
+        if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT_SETTINGS"] {
+            showSettings()
+            snapshot(settingsWindow!, to: path)
+        }
         #endif
     }
 
+    func showSettings() {
+        if settingsWindow == nil {
+            let w = NSWindow(contentRect: .zero, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            w.title = "StreamGrab Settings"
+            w.isReleasedWhenClosed = false
+            w.contentView = NSHostingView(rootView: SettingsView())
+            w.setContentSize(w.contentView!.fittingSize)
+            w.center()
+            settingsWindow = w
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func openSettings() { showSettings() }
+
     #if DEBUG
-    /// Debug builds: render the window to a PNG (for checking the UI without screen-recording access).
-    private func snapshot(to path: String) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [self] in
-            guard let view = window.contentView?.superview, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+    /// Debug builds: render a window to a PNG (for checking the UI without screen-recording access).
+    private func snapshot(_ target: NSWindow, to path: String) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+            guard let view = target.contentView?.superview, let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
             view.cacheDisplay(in: view.bounds, to: rep)
             try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
         }
@@ -136,6 +157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         submenu("StreamGrab", [
             item("About StreamGrab", #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
+            .separator(),
+            item("Settings…", #selector(openSettings), ","),
             .separator(),
             item("Hide StreamGrab", #selector(NSApplication.hide(_:)), "h"),
             item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),

@@ -3,7 +3,6 @@ import SwiftUI
 /// View-local state. (`@State` is a macro in recent SDKs, which Command Line Tools can't expand.)
 final class MainViewState: ObservableObject {
     @Published var newURL = ""
-    @Published var showSettings = false
 }
 
 struct MainView: View {
@@ -23,7 +22,7 @@ struct MainView: View {
                 Button { manager.clearFinished() } label: { Image(systemName: "checkmark.circle.badge.xmark") }
                     .help("Clear finished downloads")
                     .disabled(!manager.items.contains { $0.status == .completed })
-                Button { state.showSettings = true } label: { Image(systemName: "gearshape") }
+                Button { (NSApp.delegate as? AppDelegate)?.showSettings() } label: { Image(systemName: "gearshape") }
                     .help("Settings")
             }
             .padding(10)
@@ -39,7 +38,6 @@ struct MainView: View {
             }
         }
         .frame(minWidth: 560, minHeight: 320)
-        .sheet(isPresented: $state.showSettings) { SettingsView() }
     }
 
     private func addURL() {
@@ -215,42 +213,74 @@ struct SetupGuide: View {
 
 struct SettingsView: View {
     @ObservedObject var settings = Settings.shared
-    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Settings").font(.title2.bold())
-            Form {
+        Form {
+            Section {
                 LabeledContent("Save videos to") {
-                    HStack {
-                        Text(settings.folder.path).lineLimit(1).truncationMode(.middle).frame(maxWidth: 240, alignment: .leading)
+                    HStack(spacing: 8) {
+                        Image(nsImage: NSWorkspace.shared.icon(forFile: settings.folder.path))
+                            .resizable().frame(width: 16, height: 16)
+                        Text(FileManager.default.displayName(atPath: settings.folder.path))
+                            .lineLimit(1).truncationMode(.middle)
+                            .help(settings.folder.path)
                         Button("Choose…", action: chooseFolder)
                     }
                 }
-                Stepper("Connections per download: \(settings.connections)", value: $settings.connections, in: 1 ... 16)
-                Stepper("Downloads at the same time: \(settings.simultaneous)", value: $settings.simultaneous, in: 1 ... 6)
-                LabeledContent("ffmpeg") {
-                    if let f = Paths.ffmpeg {
-                        Text("Found at \(f.path)").foregroundStyle(.secondary)
-                    } else {
-                        Text("Not found. Streams are saved as .ts, and separate sound tracks can't be merged into the video. Install with `brew install ffmpeg`.")
-                            .foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
-                    }
+                Picker("Connections per download", selection: $settings.connections) {
+                    ForEach(Settings.connectionChoices, id: \.self) { Text("\($0)").tag($0) }
                 }
-                LabeledContent("Chrome extension") {
-                    HStack {
-                        Button("Open chrome://extensions") { Setup.openExtensionsPage() }
-                        Button("Show Folder") { Setup.revealExtension() }
-                    }
+                Picker("Downloads at the same time", selection: $settings.simultaneous) {
+                    ForEach(1 ... 6, id: \.self) { Text("\($0)").tag($0) }
                 }
+            } header: {
+                Text("Downloads")
+            } footer: {
+                Text("More connections can speed up large video files on servers that allow it.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            HStack {
-                Spacer()
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
+
+            Section {
+                LabeledContent("ffmpeg") {
+                    if Paths.ffmpeg != nil {
+                        Label("Installed", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("Not installed", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            } header: {
+                Text("Video & Sound")
+            } footer: {
+                Group {
+                    if let f = Paths.ffmpeg {
+                        Text("Used to merge video and sound into one .mp4 file. Found at \(f.path).")
+                    } else {
+                        Text("Without ffmpeg, sound that comes as a separate track is saved as a separate file, and some streams are saved as .ts. Install it with Homebrew: brew install ffmpeg")
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+
+            Section {
+                LabeledContent("Extensions page") {
+                    Button("Open in Chrome") { Setup.openExtensionsPage() }
+                }
+                LabeledContent("Extension folder") {
+                    Button("Show in Finder") { Setup.revealExtension() }
+                }
+            } header: {
+                Text("Chrome Extension")
+            } footer: {
+                Text("On the extensions page, turn on Developer mode, click Load unpacked, and choose the extension folder. The download button appears on pages while StreamGrab is open.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .padding(20)
-        .frame(width: 520)
+        .formStyle(.grouped)
+        .padding(.bottom, 6)
+        .frame(width: 500)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func chooseFolder() {
@@ -258,6 +288,7 @@ struct SettingsView: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
+        panel.prompt = "Choose"
         panel.directoryURL = settings.folder
         if panel.runModal() == .OK, let url = panel.url { settings.folder = url }
     }

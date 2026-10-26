@@ -41,10 +41,14 @@ final class Settings: ObservableObject {
         didSet { d.set(simultaneous, forKey: "simultaneous") }
     }
 
+    static let connectionChoices = [1, 2, 4, 8, 12, 16]
+
     private init() {
         folder = d.string(forKey: "folder").map { URL(fileURLWithPath: $0) }
             ?? FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
-        connections = d.object(forKey: "connections") as? Int ?? 8
+        // Older versions allowed any number; snap to one of the choices the Settings menu offers.
+        let saved = d.object(forKey: "connections") as? Int ?? 8
+        connections = Self.connectionChoices.min { abs($0 - saved) < abs($1 - saved) } ?? 8
         simultaneous = d.object(forKey: "simultaneous") as? Int ?? 3
     }
 }
