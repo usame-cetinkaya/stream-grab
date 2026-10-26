@@ -49,9 +49,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT"] { snapshot(window, to: path) }
         if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT_CONVERT"] {
             let w = NSWindow(contentRect: .zero, styleMask: [.titled], backing: .buffered, defer: false)
-            w.contentView = NSHostingView(rootView: ConvertPanel(form: ConvertForm()) {})
+            // Scripts can't make the app active, so draw as if the window were focused.
+            w.contentView = NSHostingView(rootView: ConvertPanel(form: ConvertForm(), title: "Big Buck Bunny [1080p].mp4") {} start: {}
+                .environment(\.controlActiveState, .key))
             w.setContentSize(w.contentView!.fittingSize)
-            w.orderFront(nil)
+            window.orderOut(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            w.makeKeyAndOrderFront(nil)
             snapshot(w, to: path)
         }
         if let path = ProcessInfo.processInfo.environment["STREAMGRAB_SNAPSHOT_SETTINGS"] {

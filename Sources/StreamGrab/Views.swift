@@ -187,7 +187,9 @@ struct DownloadRow: View {
                         form.shown = true
                     }
                     .popover(isPresented: $form.shown, arrowEdge: .bottom) {
-                        ConvertPanel(form: form) {
+                        ConvertPanel(form: form, title: item.job.title) {
+                            form.shown = false
+                        } start: {
                             form.shown = false
                             manager.convert(item.id, format: form.format, height: form.height, maxMB: form.maxMB)
                         }
@@ -286,37 +288,67 @@ struct DownloadRow: View {
 /// Resolution, size and format for converting one download.
 struct ConvertPanel: View {
     @ObservedObject var form: ConvertForm
+    let title: String
+    let cancel: () -> Void
     let start: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Convert a Copy").font(.headline)
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 8))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Convert a Copy").font(.headline)
+                    Text(title).font(.callout).foregroundStyle(.secondary).lineLimit(1).truncationMode(.middle)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, 18)
+
             Form {
-                Picker("Resolution", selection: $form.height) {
-                    ForEach(Settings.convertHeights, id: \.self) { Text("\($0)p").tag($0) }
-                }
-                LabeledContent("Maximum size") {
-                    HStack(spacing: 6) {
-                        TextField("Maximum size", text: megabytes($form.maxMB))
-                            .labelsHidden().multilineTextAlignment(.trailing).frame(width: 80)
-                        Text("MB").foregroundStyle(.secondary)
+                Section {
+                    Picker("Resolution", selection: $form.height) {
+                        ForEach(Settings.convertHeights, id: \.self) { Text("\($0)p").tag($0) }
                     }
-                }
-                Picker("Format", selection: $form.format) {
-                    ForEach(ConversionFormat.available, id: \.self) { Text($0.label).tag($0) }
+                    LabeledContent("Maximum size") {
+                        HStack(spacing: 6) {
+                            TextField("Maximum size", text: megabytes($form.maxMB))
+                                .labelsHidden()
+                                .textFieldStyle(.roundedBorder)
+                                .multilineTextAlignment(.trailing)
+                                .frame(width: 70)
+                            Text("MB").foregroundStyle(.secondary)
+                        }
+                    }
+                    Picker("Format", selection: $form.format) {
+                        ForEach(ConversionFormat.available, id: \.self) { Text($0.label).tag($0) }
+                    }
+                } footer: {
+                    Text("The original is kept. If the copy fits at the original's quality it stays that way; otherwise the quality is lowered just enough to fit.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            Text("The original is kept. These choices apply to this download only.")
-                .font(.caption).foregroundStyle(.secondary)
-            HStack {
+            .formStyle(.grouped)
+            .scrollDisabled(true)
+            .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
                 Spacer()
+                Button("Cancel", action: cancel).keyboardShortcut(.cancelAction)
                 Button("Convert", action: start)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(form.maxMB < 1)
+                    .buttonStyle(.borderedProminent)
             }
+            .controlSize(.large)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 18)
         }
-        .padding(16)
-        .frame(width: 380)
+        .frame(width: 440)
     }
 }
 
@@ -489,6 +521,7 @@ struct SettingsView: View {
                         HStack(spacing: 6) {
                             TextField("Maximum size", text: megabytes($settings.convertMaxMB))
                                 .labelsHidden()
+                                .textFieldStyle(.roundedBorder)
                                 .multilineTextAlignment(.trailing)
                                 .frame(width: 80)
                             Text("MB").foregroundStyle(.secondary)
