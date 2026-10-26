@@ -2,7 +2,8 @@ import Foundation
 
 /// What the browser extension (or the "Add URL" field) asks us to download.
 struct Job: Codable, Hashable {
-    enum Kind: String, Codable { case hls, dash, direct }
+    /// `local`: a video file added from disk (drag and drop, Add Video File…), already "finished".
+    enum Kind: String, Codable { case hls, dash, direct, local }
     var kind: Kind
     var url: String
     /// Separate audio: an HLS audio playlist, or an audio file to merge with a direct video file.
@@ -187,6 +188,7 @@ final class Engine: @unchecked Sendable {
         case .direct: return try await runDirect(destination: destination, ffmpeg: ffmpeg)
         case .hls: return try await runHLS(destination: destination, ffmpeg: ffmpeg)
         case .dash: return try await runDASH(destination: destination, ffmpeg: ffmpeg)
+        case .local: throw GrabError("This video was added from disk; there's nothing to download.")
         }
     }
 

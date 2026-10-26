@@ -34,6 +34,10 @@ the whole stream.
      and shrunk again if it overshoots. A copy is never inflated toward the limit.
   Turn it on in Settings to convert every finished download, or use **Convert…** on any finished download
   to make a copy with its own settings, as many times as you like. Copies are made one at a time.
+- **Videos already on your Mac** can be added and converted like downloads: drag them onto the window, use
+  the add button / **File ▸ Add Video File…** (⌘O), or **Open With ▸ StreamGrab** in Finder. They stay where
+  they are (removing one from the list never deletes it); copies are saved next to them, or in the download
+  folder when that folder isn't writable.
 - Pause, resume (even after quitting the app), retry, and a list of finished downloads with how long they took.
 - Paste a link into the app to download it without the browser.
 

@@ -255,7 +255,10 @@ final class DownloadManager: ObservableObject {
             updateConversion(itemID, convID) { $0.state = .failed; $0.error = "The downloaded file is no longer there." }
             return scheduleConversion()
         }
-        let output = Self.uniqueURL(input.deletingLastPathComponent()
+        // Next to the original; if that folder can't be written to, the download folder.
+        var folder = input.deletingLastPathComponent()
+        if !FileManager.default.isWritableFile(atPath: folder.path) { folder = settings.folder }
+        let output = Self.uniqueURL(folder
             .appendingPathComponent("\(input.deletingPathExtension().lastPathComponent) (\(c.height)p \(c.format.short))")
             .appendingPathExtension(c.format.fileExtension))
         let converter = Converter(ffmpeg: ffmpeg)
@@ -319,6 +322,52 @@ final class DownloadManager: ObservableObject {
             }
         }
         scheduleConversion()
+    }
+
+    // MARK: Videos added from disk
+
+    /// Common video file extensions, for files macOS doesn't know as movies (e.g. .mkv without a player).
+    private static let videoExtensions: Set<String> = ["mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "ts", "m2ts", "mts", "mpg", "mpeg", "3gp", "ogv"]
+
+    static func looksLikeVideo(_ url: URL) -> Bool {
+        if videoExtensions.contains(url.pathExtension.lowercased()) { return true }
+        let type = (try? url.resourceValues(forKeys: [.contentTypeKey]))?.contentType
+        return type?.conforms(to: .movie) == true
+    }
+
+    /// Adds existing video files as if StreamGrab had just downloaded them: they can be converted
+    /// automatically (when that's on) or with Convert…. The files stay where they are.
+    /// Returns how many were added (videos already in the list and non-videos are skipped).
+    @discardableResult
+    func addFiles(_ urls: [URL]) -> Int {
+        var added = 0
+        for url in urls {
+            let url = url.standardizedFileURL
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), !isDir.boolValue,
+                  Self.looksLikeVideo(url),
+                  !items.contains(where: { $0.job.kind == .local && $0.file?.standardizedFileURL == url }) else { continue }
+            var item = DownloadItem(job: Job(kind: .local, url: url.absoluteString, title: url.deletingPathExtension().lastPathComponent))
+            item.status = .completed
+            item.file = url
+            item.totalBytes = ((try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? NSNumber)?.int64Value
+            item.bytesDone = item.totalBytes ?? 0
+            items.insert(item, at: 0)
+            changed()
+            added += 1
+            let id = item.id
+            if let ffmpeg = Paths.ffmpeg {
+                // Show the resolution like downloads do (ffprobe, off the main thread).
+                Task.detached {
+                    let height = Converter.videoHeight(url, ffmpeg: ffmpeg)
+                    await MainActor.run { DownloadManager.shared.set(id) { $0.job.quality = height.map { "\($0)p" } } }
+                }
+            }
+            if settings.convert, Paths.ffmpeg != nil {
+                convert(id, format: settings.convertFormat, height: settings.convertHeight, maxMB: settings.convertMaxMB)
+            }
+        }
+        return added
     }
 
     /// The Convert… button on a finished download: its own settings, whatever the global ones are.
@@ -486,7 +535,7 @@ final class DownloadManager: ObservableObject {
         if let map = s.map, s.phase == .downloading, maps[id] != map { maps[id] = map }
     }
 
-    private func set(_ id: UUID, _ change: (inout DownloadItem) -> Void) {
+    fileprivate func set(_ id: UUID, _ change: (inout DownloadItem) -> Void) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         change(&items[i])
         changed()

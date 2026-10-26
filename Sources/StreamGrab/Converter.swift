@@ -305,6 +305,20 @@ final class Converter: @unchecked Sendable {
         var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
     }
 
+    /// The height of a file's video, or nil if it has no video stream ffprobe can read.
+    static func videoHeight(_ file: URL, ffmpeg: URL) -> Int? {
+        let p = Process()
+        let pipe = Pipe()
+        p.executableURL = ffmpeg.deletingLastPathComponent().appendingPathComponent("ffprobe")
+        p.arguments = ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", file.path]
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        p.waitUntilExit()
+        return Int(out.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: "\n").first ?? "")
+    }
+
     private struct Info {
         var duration: Double
         var height: Int?

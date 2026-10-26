@@ -3,6 +3,25 @@ import SwiftUI
 /// View-local state. (`@State` is a macro in recent SDKs, which Command Line Tools can't expand.)
 final class MainViewState: ObservableObject {
     @Published var newURL = ""
+    @Published var dropTargeted = false
+
+    init() {
+        #if DEBUG
+        dropTargeted = ProcessInfo.processInfo.environment["STREAMGRAB_DROP_PREVIEW"] != nil // screenshots of the drop highlight
+        #endif
+    }
+}
+
+/// The open panel behind "Add Video File…" (toolbar button and File menu).
+@MainActor func chooseVideoFiles() {
+    let panel = NSOpenPanel()
+    panel.title = "Add Video Files"
+    panel.message = "Choose videos to convert. The files stay where they are."
+    panel.prompt = "Add"
+    panel.allowsMultipleSelection = true
+    panel.canChooseDirectories = false
+    panel.allowedContentTypes = [.movie, .audiovisualContent]
+    if panel.runModal() == .OK { DownloadManager.shared.addFiles(panel.urls) }
 }
 
 struct MainView: View {
@@ -17,6 +36,8 @@ struct MainView: View {
                     .onSubmit(addURL)
                 Button("Download", action: addURL).disabled(URL(string: state.newURL)?.scheme?.hasPrefix("http") != true)
                 Divider().frame(height: 18)
+                Button { chooseVideoFiles() } label: { Image(systemName: "doc.badge.plus") }
+                    .help("Add a video file from your Mac to convert it (or drag files onto this window)")
                 Button { NSWorkspace.shared.open(Settings.shared.folder) } label: { Image(systemName: "folder") }
                     .help("Open download folder")
                 Button { manager.clearFinished() } label: { Image(systemName: "checkmark.circle.badge.xmark") }
@@ -38,6 +59,37 @@ struct MainView: View {
             }
         }
         .frame(minWidth: 560, minHeight: 320)
+        .onDrop(of: [.fileURL], isTargeted: $state.dropTargeted) { providers in
+            for provider in providers {
+                _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                    guard let url else { return }
+                    Task { @MainActor in DownloadManager.shared.addFiles([url]) }
+                }
+            }
+            return true
+        }
+        .overlay {
+            if state.dropTargeted {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color(nsColor: .windowBackgroundColor).opacity(0.94))
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.accentColor.opacity(0.08))
+                    RoundedRectangle(cornerRadius: 12)
+                        .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                    VStack(spacing: 10) {
+                        Image(systemName: "film.stack")
+                            .font(.system(size: 40, weight: .light))
+                        Text("Drop videos to add them").font(.title2.weight(.semibold))
+                        Text("They stay where they are; you can convert them like downloads.")
+                            .font(.callout).foregroundStyle(.secondary)
+                    }
+                    .foregroundStyle(Color.accentColor)
+                }
+                .padding(8)
+                .allowsHitTesting(false)
+            }
+        }
     }
 
     private func addURL() {
@@ -125,9 +177,11 @@ struct DownloadRow: View {
             if let page = item.job.pageURL, let url = URL(string: page) {
                 Button("Open Web Page") { NSWorkspace.shared.open(url) }
             }
-            Button("Copy Media Link") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(item.job.url, forType: .string)
+            if item.job.kind != .local {
+                Button("Copy Media Link") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(item.job.url, forType: .string)
+                }
             }
             Divider()
             Button("Remove from List") { manager.remove(item.id) }
@@ -209,7 +263,7 @@ struct DownloadRow: View {
 
     private var icon: String {
         switch item.status {
-        case .completed: "checkmark.circle.fill"
+        case .completed: item.job.kind == .local ? "film.circle.fill" : "checkmark.circle.fill"
         case .failed: item.retryAt == nil ? "exclamationmark.triangle.fill" : "arrow.clockwise.circle.fill"
         case .paused: "pause.circle.fill"
         case .queued: "clock.fill"
@@ -219,7 +273,7 @@ struct DownloadRow: View {
 
     private var color: Color {
         switch item.status {
-        case .completed: .green
+        case .completed: item.job.kind == .local ? .accentColor : .green
         case .failed: item.retryAt == nil ? .red : .orange
         case .paused, .queued: .secondary
         case .downloading, .merging: .accentColor
@@ -252,6 +306,10 @@ struct DownloadRow: View {
             if let t = item.elapsed {
                 took = "took \(Self.duration(t))"
                 if t >= 1, let total = item.totalBytes { average = "\(size(Int64(Double(total) / t)))/s" }
+            }
+            if item.job.kind == .local {
+                return [item.totalBytes.map(size), "added from \(item.file?.deletingLastPathComponent().lastPathComponent ?? "disk")",
+                        item.file?.lastPathComponent].compactMap { $0 }.joined(separator: " · ")
             }
             return [item.totalBytes.map(size), took, average, item.file?.lastPathComponent].compactMap { $0 }.joined(separator: " · ")
         case .failed:
@@ -463,6 +521,8 @@ struct SetupGuide: View {
                 Button("Open chrome://extensions") { Setup.openExtensionsPage() }
                 Button("Show Extension Folder") { Setup.revealExtension() }
             }
+            Label("You can also drag video files from your Mac onto this window to convert them.", systemImage: "film")
+                .foregroundStyle(.secondary)
             Text("Tip: in the Load unpacked dialog, press ⌘⇧G and paste the folder path:\n\(Paths.installedExtension.path)")
                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
             Spacer()

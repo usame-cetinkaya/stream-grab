@@ -127,6 +127,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                   let h = message["height"] as? Int, let mb = message["maxMB"] as? Int else { return ["ok": false] }
             DownloadManager.shared.convert(item.id, format: f, height: h, maxMB: mb)
             return ["ok": true]
+        case "debugAddFiles": // tests add files as if dropped on the window
+            let paths = message["paths"] as? [String] ?? []
+            return ["ok": true, "added": DownloadManager.shared.addFiles(paths.map { URL(fileURLWithPath: $0) })]
         case "debugRemove": // tests press a download's × without the UI
             guard let item = DownloadManager.shared.items.first else { return ["ok": false] }
             DownloadManager.shared.remove(item.id)
@@ -145,6 +148,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.deminiaturize(nil)
             window.orderFrontRegardless()
         }
+    }
+
+    @objc private func addVideoFiles() {
+        showWindow(activate: true)
+        chooseVideoFiles()
+    }
+
+    /// Finder's Open With ▸ StreamGrab, or videos dropped on the Dock icon.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        DownloadManager.shared.addFiles(urls.filter(\.isFileURL))
+        showWindow(activate: true)
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -193,6 +207,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             item("Show All", #selector(NSApplication.unhideAllApplications(_:))),
             .separator(),
             item("Quit StreamGrab", #selector(NSApplication.terminate(_:)), "q"),
+        ])
+        submenu("File", [
+            item("Add Video File…", #selector(addVideoFiles), "o"),
         ])
         submenu("Edit", [
             item("Undo", Selector(("undo:")), "z"),
