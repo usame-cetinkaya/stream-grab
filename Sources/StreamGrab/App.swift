@@ -74,9 +74,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
             let item = DownloadManager.shared.add(job)
             delegate?.showWindow(activate: false)
-            return ["ok": true, "id": item.id.uuidString]
+            var reply: [String: Any] = ["ok": true, "id": item.id.uuidString]
+            if job.mayNeedMerge, Paths.ffmpeg == nil {
+                reply["warning"] = "ffmpeg isn't installed, so the sound will be saved as a separate file."
+            }
+            return reply
         case "show":
             delegate?.showWindow(activate: true)
+            return ["ok": true]
+        case "ping":
             return ["ok": true]
         default:
             return ["ok": false, "error": "Unknown request"]

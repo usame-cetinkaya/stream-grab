@@ -1,13 +1,20 @@
 # StreamGrab
 
-An IDM-style video grabber for macOS (Apple Silicon only, macOS 13+). Play a video in Chrome and a **Download this video** button
-appears over it; open its menu, pick a quality (1080p, 720p, 480p…), and the StreamGrab app downloads
+An IDM-style video grabber for macOS (Apple Silicon only, macOS 13+). Open StreamGrab, play a video in Chrome, and a
+**Download this video** button appears over it; open its menu, pick a quality (1080p, 720p, 480p…), and the StreamGrab app downloads
 the whole stream.
 
 - **HLS streams** (`.m3u8`, the format most streaming sites use): lists every quality from the
   master playlist with an estimated size, downloads segments in parallel, decrypts AES-128
   segments, and merges video and separate audio tracks into one `.mp4` with ffmpeg.
+- **DASH streams** (`.mpd`): segment templates (numbered or timeline), segment lists and
+  single-file tracks. Each quality is paired with the best audio track and merged.
 - **Plain video files** (`.mp4`, `.webm`, …): split into pieces and fetched over 8 connections, like IDM.
+  When a site plays a video file with its sound in a separate file from the same folder, the two
+  are merged (unless the video already has sound of its own).
+- **No silent downloads:** the pieces a stream is made of aren't offered as videos of their own, so you
+  don't end up with a video-only file. If ffmpeg is missing, you're told the sound was saved separately.
+- The button only appears while the StreamGrab app is open (the toolbar popup still lists what it found).
 - Replays the page's own request headers (Referer, Origin, Cookie, User-Agent), so CDNs that
   check them still serve the stream.
 - Pause, resume (even after quitting the app), retry, and a list of finished downloads.
@@ -29,8 +36,8 @@ Download the latest `.dmg` and `StreamGrab-Chrome-Extension-*.zip` from
    `~/Library/Application Support/StreamGrab/Chrome Extension` (its **Show Extension Folder** button reveals it).
 3. Reload open tabs and play a video.
 
-Optional but recommended: `brew install ffmpeg`. Without it, HLS downloads are saved as `.ts`
-(plays in IINA/VLC) and separate audio tracks stay in a separate file.
+Recommended: `brew install ffmpeg`. Without it, HLS downloads are saved as `.ts` (plays in IINA/VLC)
+and separate audio tracks are saved next to the video instead of inside it.
 
 ## How it works
 
@@ -38,11 +45,12 @@ Optional but recommended: `brew install ffmpeg`. Without it, HLS downloads are s
  Chrome tab ──► content.js ─ draws the button + quality menu over the <video>
      │                ▲
      ▼                │ items for this frame
- background.js ───────┘ watches network requests (webRequest) for .m3u8 / video files
+ background.js ───────┘ watches network requests (webRequest) for .m3u8 / .mpd / video and audio files
      │  chrome.runtime.sendNativeMessage("com.streamgrab.host")
      ▼
  StreamGrab (launched by Chrome as the native host: same executable, no UI)
-     │  "probe": fetch the playlist with the page's headers → qualities, duration, DRM/live flags
+     │  "ping": is the app open? (the page button only shows while it is)
+     │  "probe": fetch the playlist/manifest with the page's headers → qualities, duration, DRM/live flags
      │  "download": forward over a Unix socket to the app (launches it if needed)
      ▼
  StreamGrab.app ─ download manager: Engine (pieces → decrypt → concat → ffmpeg remux)
@@ -53,6 +61,7 @@ Optional but recommended: `brew install ffmpeg`. Without it, HLS downloads are s
 | `Sources/StreamGrab/App.swift` | Entry point (app vs. native host), window, menus, socket requests |
 | `Sources/StreamGrab/NativeHost.swift` | Chrome native-messaging protocol, playlist probing |
 | `Sources/StreamGrab/HLS.swift` | m3u8 parsing, AES-128 decryption |
+| `Sources/StreamGrab/DASH.swift` | MPD parsing (templates, timelines, segment lists, single files) |
 | `Sources/StreamGrab/Engine.swift` | Piece downloads, resume, merge, ffmpeg remux |
 | `Sources/StreamGrab/Fetcher.swift` | URLSession wrapper that replays browser headers |
 | `Sources/StreamGrab/DownloadManager.swift` | Queue, pause/resume, persistence, settings |

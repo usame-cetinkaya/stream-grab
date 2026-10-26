@@ -13,7 +13,7 @@ struct MainView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                TextField("Paste a video or .m3u8 link…", text: $state.newURL)
+                TextField("Paste a video, .m3u8 or .mpd link…", text: $state.newURL)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(addURL)
                 Button("Download", action: addURL).disabled(URL(string: state.newURL)?.scheme?.hasPrefix("http") != true)
@@ -45,9 +45,10 @@ struct MainView: View {
     private func addURL() {
         let s = state.newURL.trimmingCharacters(in: .whitespaces)
         guard let url = URL(string: s), url.scheme?.hasPrefix("http") == true else { return }
-        let isHLS = url.pathExtension.lowercased() == "m3u8" || s.contains(".m3u8")
+        let ext = url.pathExtension.lowercased()
+        let kind: Job.Kind = ext == "m3u8" || s.contains(".m3u8") ? .hls : ext == "mpd" || s.contains(".mpd") ? .dash : .direct
         let name = url.deletingPathExtension().lastPathComponent
-        manager.add(Job(kind: isHLS ? .hls : .direct, url: s, title: name.isEmpty ? url.host ?? "video" : name))
+        manager.add(Job(kind: kind, url: s, title: name.isEmpty ? url.host ?? "video" : name))
         state.newURL = ""
     }
 }
@@ -78,6 +79,10 @@ struct DownloadRow: View {
                     }
                 }
                 Text(detail).font(.caption).foregroundStyle(item.status == .failed ? .red : .secondary).lineLimit(2)
+                if let note = item.note {
+                    Label(note, systemImage: "speaker.slash")
+                        .font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 8)
             buttons
@@ -154,10 +159,10 @@ struct DownloadRow: View {
         case .paused, .downloading:
             var parts: [String] = []
             if let f = item.fraction { parts.append("\(Int(f * 100))%") }
-            let approx = item.job.kind == .hls ? "~" : ""
+            let approx = item.job.kind != .direct ? "~" : ""
             if let t = item.totalBytes { parts.append("\(size(item.bytesDone)) of \(approx)\(size(t))") }
             else if item.bytesDone > 0 { parts.append(size(item.bytesDone)) }
-            if item.job.kind == .hls, item.piecesTotal > 0 { parts.append("\(item.piecesDone)/\(item.piecesTotal) segments") }
+            if item.job.kind != .direct, item.piecesTotal > 0 { parts.append("\(item.piecesDone)/\(item.piecesTotal) segments") }
             if item.status == .paused { parts.append("Paused") }
             else if item.speed > 0 {
                 parts.append("\(size(Int64(item.speed)))/s")
@@ -180,7 +185,7 @@ struct SetupGuide: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("Connect StreamGrab to Chrome").font(.title2.bold())
-            Text("Once the extension is installed, a **Download this video** button appears over videos you play. Pick a quality and the download shows up here.")
+            Text("Once the extension is installed, a **Download this video** button appears over videos you play while StreamGrab is open. Pick a quality and the download shows up here.")
                 .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 8) {
                 step(1, "Open **chrome://extensions** and turn on **Developer mode** (top right).")
@@ -228,7 +233,7 @@ struct SettingsView: View {
                     if let f = Paths.ffmpeg {
                         Text("Found at \(f.path)").foregroundStyle(.secondary)
                     } else {
-                        Text("Not found. Streams are saved as .ts. Install with `brew install ffmpeg` for .mp4 files.")
+                        Text("Not found. Streams are saved as .ts, and separate sound tracks can't be merged into the video. Install with `brew install ffmpeg`.")
                             .foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
                     }
                 }

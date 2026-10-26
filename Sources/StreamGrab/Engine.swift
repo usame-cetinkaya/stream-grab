@@ -2,14 +2,38 @@ import Foundation
 
 /// What the browser extension (or the "Add URL" field) asks us to download.
 struct Job: Codable, Hashable {
-    enum Kind: String, Codable { case hls, direct }
+    enum Kind: String, Codable { case hls, dash, direct }
     var kind: Kind
     var url: String
+    /// Separate audio: an HLS audio playlist, or an audio file to merge with a direct video file.
     var audioURL: String?
+    /// DASH: the chosen representations (best available when missing).
+    var videoID: String?
+    var audioID: String?
     var title: String
     var quality: String?
     var pageURL: String?
     var headers: [String: String] = [:]
+
+    init(kind: Kind, url: String, title: String) {
+        self.kind = kind; self.url = url; self.title = title
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decode(Kind.self, forKey: .kind)
+        url = try c.decode(String.self, forKey: .url)
+        title = try c.decode(String.self, forKey: .title)
+        audioURL = try c.decodeIfPresent(String.self, forKey: .audioURL)
+        videoID = try c.decodeIfPresent(String.self, forKey: .videoID)
+        audioID = try c.decodeIfPresent(String.self, forKey: .audioID)
+        quality = try c.decodeIfPresent(String.self, forKey: .quality)
+        pageURL = try c.decodeIfPresent(String.self, forKey: .pageURL)
+        headers = try c.decodeIfPresent([String: String].self, forKey: .headers) ?? [:]
+    }
+
+    /// Whether this download has to merge a separate audio track (which needs ffmpeg).
+    var mayNeedMerge: Bool { audioURL != nil || kind == .dash }
 }
 
 /// Downloads one job into a work folder, piece by piece, then merges it into the final file.
@@ -22,8 +46,14 @@ final class Engine: @unchecked Sendable {
         var piecesDone = 0
         var piecesTotal = 0
         var bytesDone: Int64 = 0
-        var totalBytes: Int64?   // exact for direct downloads, estimated for HLS
+        var totalBytes: Int64?   // exact for direct downloads, estimated for streams
         var bytesPerSecond: Double = 0
+    }
+
+    struct Output {
+        var file: URL
+        /// Something the user should know, e.g. audio saved separately because ffmpeg is missing.
+        var note: String?
     }
 
     private struct Piece {
@@ -32,6 +62,8 @@ final class Engine: @unchecked Sendable {
         var range: ClosedRange<Int64>?
         var key: HLS.Key?
     }
+
+    static let noFFmpegNote = "Sound was saved as a separate file because ffmpeg isn't installed. Run “brew install ffmpeg” to get one file with sound."
 
     let job: Job
     let workDir: URL
@@ -69,51 +101,71 @@ final class Engine: @unchecked Sendable {
     }
 
     /// Runs the whole download and returns the finished file in `destination`.
-    func run(destination: URL, ffmpeg: URL?) async throws -> URL {
+    func run(destination: URL, ffmpeg: URL?) async throws -> Output {
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         switch job.kind {
-        case .direct: return try await runDirect(destination: destination)
+        case .direct: return try await runDirect(destination: destination, ffmpeg: ffmpeg)
         case .hls: return try await runHLS(destination: destination, ffmpeg: ffmpeg)
+        case .dash: return try await runDASH(destination: destination, ffmpeg: ffmpeg)
         }
     }
 
     // MARK: - Direct files (multi-connection, like IDM)
 
-    private func runDirect(destination: URL) async throws -> URL {
+    private func runDirect(destination: URL, ffmpeg: URL?) async throws -> Output {
         guard let url = URL(string: job.url) else { throw GrabError("Invalid URL.") }
-        var pieces: [Piece] = []
-        var total: Int64?
-        var ext = url.pathExtension.lowercased()
+        let (videoPieces, videoTotal, videoMIME) = try await filePieces(url, prefix: "d")
+        var audioPieces: [Piece] = []
+        var audioTotal: Int64? = 0
+        var audioMIME: String?
+        if let a = job.audioURL.flatMap(URL.init(string:)) {
+            (audioPieces, audioTotal, audioMIME) = try await filePieces(a, prefix: "x")
+        }
+        update { $0.totalBytes = videoTotal.flatMap { v in audioTotal.map { v + $0 } } }
 
+        try await fetchAll(videoPieces + audioPieces)
+        update { $0.phase = .merging }
+        var ext = url.pathExtension.lowercased()
+        if ext.isEmpty || ext.count > 4 { ext = Self.fileExtension(forMIME: videoMIME) ?? "mp4" }
+        let videoFile = workDir.appendingPathComponent("video.\(ext)")
+        try concatenate(videoPieces.map(\.name), into: videoFile)
+        guard !audioPieces.isEmpty else {
+            return Output(file: try moveToDestination(videoFile, folder: destination, ext: ext))
+        }
+        var aExt = job.audioURL.flatMap(URL.init(string:))?.pathExtension.lowercased() ?? ""
+        if aExt.isEmpty || aExt.count > 4 { aExt = Self.fileExtension(forMIME: audioMIME) ?? "m4a" }
+        let audioFile = workDir.appendingPathComponent("audio.\(aExt)")
+        try concatenate(audioPieces.map(\.name), into: audioFile)
+        // A file that already has its own sound keeps it; the separate track was a wrong guess.
+        if let ffmpeg, Self.hasAudioStream(videoFile, ffmpeg: ffmpeg) {
+            return Output(file: try moveToDestination(videoFile, folder: destination, ext: ext))
+        }
+        return try await finish(video: videoFile, audio: audioFile, rawExt: ext, destination: destination, ffmpeg: ffmpeg)
+    }
+
+    /// A whole file as ranged pieces (or one piece when the server can't do ranges).
+    private func filePieces(_ url: URL, prefix: String) async throws -> ([Piece], Int64?, String?) {
         let probe = try await fetcher.head(url, range: 0 ... 0)
-        if ext.isEmpty || ext.count > 4 { ext = Self.fileExtension(forMIME: probe.mimeType) ?? "mp4" }
         if probe.statusCode == 206, let cr = probe.value(forHTTPHeaderField: "Content-Range"),
            let size = cr.split(separator: "/").last.flatMap({ Int64($0) }), size > 0 {
-            total = size
             let chunk = max(4 << 20, size / 2000)
+            var pieces: [Piece] = []
             var start: Int64 = 0
             while start < size {
                 let end = min(start + chunk, size) - 1
-                pieces.append(Piece(name: String(format: "d%06d", pieces.count), url: url, range: start ... end))
+                pieces.append(Piece(name: String(format: "\(prefix)%06d", pieces.count), url: url, range: start ... end))
                 start = end + 1
             }
-        } else {
-            // No range support: one connection, restarts from zero after a pause.
-            total = probe.expectedContentLength > 0 ? probe.expectedContentLength : nil
-            pieces = [Piece(name: "d000000", url: url)]
+            return (pieces, size, probe.mimeType)
         }
-        update { $0.totalBytes = total }
-
-        try await fetchAll(pieces)
-        update { $0.phase = .merging }
-        let out = workDir.appendingPathComponent("merged.\(ext)")
-        try concatenate(pieces.map(\.name), into: out)
-        return try moveToDestination(out, folder: destination, ext: ext)
+        // No range support: one connection, restarts from zero after a pause.
+        let total = probe.expectedContentLength > 0 ? probe.expectedContentLength : nil
+        return ([Piece(name: "\(prefix)000000", url: url)], total, probe.mimeType)
     }
 
     // MARK: - HLS
 
-    private func runHLS(destination: URL, ffmpeg: URL?) async throws -> URL {
+    private func runHLS(destination: URL, ffmpeg: URL?) async throws -> Output {
         guard let url = URL(string: job.url) else { throw GrabError("Invalid URL.") }
         var (text, base) = try await fetcher.text(url)
         var audioURL = job.audioURL.flatMap(URL.init(string:))
@@ -160,21 +212,82 @@ final class Engine: @unchecked Sendable {
             audioFile = workDir.appendingPathComponent("audio.\(aExt)")
             try concatenate(audioPieces.map(\.name), into: audioFile!)
         }
+        return try await finish(video: videoFile, audio: audioFile, rawExt: vExt, destination: destination, ffmpeg: ffmpeg)
+    }
 
+    // MARK: - DASH
+
+    private func runDASH(destination: URL, ffmpeg: URL?) async throws -> Output {
+        guard let url = URL(string: job.url) else { throw GrabError("Invalid URL.") }
+        let (text, base) = try await fetcher.text(url)
+        let mpd = try DASH.parse(text, base: base)
+        if mpd.drm { throw GrabError("This video is DRM-protected, so it can't be downloaded.") }
+        if mpd.isLive { throw GrabError("This is a live stream. Only on-demand videos can be downloaded.") }
+        guard let video = mpd.videos.first(where: { $0.id == job.videoID }) ?? mpd.videoQualities.first else {
+            throw GrabError("The manifest has no video.")
+        }
+        let audio = job.audioID.flatMap { id in mpd.audios.first { $0.id == id } } ?? mpd.audio(for: video)
+
+        func pieces(_ t: DASH.Track, prefix: String) async throws -> [Piece] {
+            if let file = t.file { return try await filePieces(file, prefix: prefix).0 }
+            var list: [Piece] = []
+            if let i = t.initSegment { list.append(Piece(name: "\(prefix)init", url: i.url, range: i.range)) }
+            for (n, s) in t.segments.enumerated() {
+                list.append(Piece(name: String(format: "\(prefix)%06d", n), url: s.url, range: s.range))
+            }
+            return list
+        }
+        let videoPieces = try await pieces(video, prefix: "v")
+        var audioPieces: [Piece] = []
+        if let audio { audioPieces = try await pieces(audio, prefix: "a") }
+
+        try await fetchAll(videoPieces + audioPieces)
+        update { $0.phase = .merging }
+
+        let vExt = video.isWebM ? "webm" : "mp4"
+        let videoFile = workDir.appendingPathComponent("video.\(vExt)")
+        try concatenate(videoPieces.map(\.name), into: videoFile)
+        var audioFile: URL?
+        if let audio {
+            audioFile = workDir.appendingPathComponent("audio.\(audio.isWebM ? "webm" : "m4a")")
+            try concatenate(audioPieces.map(\.name), into: audioFile!)
+        }
+        return try await finish(video: videoFile, audio: audioFile, rawExt: vExt, destination: destination, ffmpeg: ffmpeg)
+    }
+
+    // MARK: - Merging
+
+    /// Remuxes video (+ separate audio) into one file. Without ffmpeg, keeps the raw files and says so.
+    private func finish(video: URL, audio: URL?, rawExt: String, destination: URL, ffmpeg: URL?) async throws -> Output {
         if let ffmpeg {
             for ext in ["mp4", "mkv"] {
                 let out = workDir.appendingPathComponent("final.\(ext)")
-                if try await Self.remux(ffmpeg: ffmpeg, video: videoFile, audio: audioFile, output: out) {
-                    return try moveToDestination(out, folder: destination, ext: ext)
+                if try await Self.remux(ffmpeg: ffmpeg, video: video, audio: audio, output: out) {
+                    return Output(file: try moveToDestination(out, folder: destination, ext: ext))
                 }
             }
         }
         // No ffmpeg (or it failed): keep the raw stream; .ts plays in IINA/VLC, fMP4 plays everywhere.
-        let result = try moveToDestination(videoFile, folder: destination, ext: vExt)
-        if let audioFile {
-            _ = try moveToDestination(audioFile, folder: destination, ext: audioFile.pathExtension, suffix: " (audio)")
-        }
-        return result
+        let result = try moveToDestination(video, folder: destination, ext: rawExt)
+        guard let audio else { return Output(file: result) }
+        _ = try moveToDestination(audio, folder: destination, ext: audio.pathExtension, suffix: " (audio)")
+        return Output(file: result, note: ffmpeg == nil ? Self.noFFmpegNote
+            : "ffmpeg couldn't merge the sound, so it was saved as a separate “(audio)” file.")
+    }
+
+    private static func hasAudioStream(_ file: URL, ffmpeg: URL) -> Bool {
+        let ffprobe = ffmpeg.deletingLastPathComponent().appendingPathComponent("ffprobe")
+        guard FileManager.default.isExecutableFile(atPath: ffprobe.path) else { return false }
+        let p = Process()
+        let pipe = Pipe()
+        p.executableURL = ffprobe
+        p.arguments = ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "csv=p=0", file.path]
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        let out = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return !(String(data: out, encoding: .utf8) ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private static func remux(ffmpeg: URL, video: URL, audio: URL?, output: URL) async throws -> Bool {
@@ -233,7 +346,7 @@ final class Engine: @unchecked Sendable {
                 update {
                     $0.piecesDone += 1
                     $0.bytesDone += bytes
-                    if job.kind == .hls, $0.piecesDone > 0 {
+                    if job.kind != .direct, $0.piecesDone > 0 {
                         $0.totalBytes = $0.bytesDone * Int64($0.piecesTotal) / Int64($0.piecesDone)
                     }
                 }

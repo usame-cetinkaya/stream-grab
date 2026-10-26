@@ -8,6 +8,7 @@ struct DownloadItem: Identifiable, Codable {
     var job: Job
     var status: Status = .queued
     var error: String?
+    var note: String?
     var file: URL?
     var piecesDone = 0
     var piecesTotal = 0
@@ -93,7 +94,7 @@ final class DownloadManager: ObservableObject {
     }
 
     func resume(_ id: UUID) {
-        set(id) { $0.status = .queued; $0.error = nil }
+        set(id) { $0.status = .queued; $0.error = nil; $0.note = nil }
         schedule()
     }
 
@@ -140,18 +141,18 @@ final class DownloadManager: ObservableObject {
         set(id) { $0.status = .downloading; $0.error = nil }
         let task = Task.detached { [engine] in
             do {
-                let file = try await engine.run(destination: folder, ffmpeg: Paths.ffmpeg)
-                await MainActor.run { DownloadManager.shared.finished(id, file: file, error: nil) }
+                let out = try await engine.run(destination: folder, ffmpeg: Paths.ffmpeg)
+                await MainActor.run { DownloadManager.shared.finished(id, file: out.file, note: out.note, error: nil) }
             } catch is CancellationError {
             } catch {
                 if Task.isCancelled { return }
-                await MainActor.run { DownloadManager.shared.finished(id, file: nil, error: error) }
+                await MainActor.run { DownloadManager.shared.finished(id, file: nil, note: nil, error: error) }
             }
         }
         engines[id] = (engine, task)
     }
 
-    private func finished(_ id: UUID, file: URL?, error: Error?) {
+    private func finished(_ id: UUID, file: URL?, note: String?, error: Error?) {
         guard engines[id] != nil else { return }
         if let snap = engines[id]?.engine.snapshot() { apply(snap, to: id) }
         engines[id] = nil
@@ -160,6 +161,7 @@ final class DownloadManager: ObservableObject {
             if let file {
                 item.status = .completed
                 item.file = file
+                item.note = note
                 item.job.headers = [:] // don't keep cookies around once they're no longer needed
                 item.totalBytes = (try? FileManager.default.attributesOfItem(atPath: file.path))?[.size] as? Int64 ?? item.bytesDone
                 item.bytesDone = item.totalBytes ?? item.bytesDone

@@ -49,6 +49,8 @@
   chrome.runtime.onMessage.addListener((m) => { if (m.type === 'refresh') load(); });
   for (const ev of ['play', 'playing', 'loadedmetadata']) document.addEventListener(ev, load, true);
   load();
+  // The button only shows while the StreamGrab app is running, so keep checking on pages with a video.
+  setInterval(() => { if (allVideos().some((v) => bigEnough(v.getBoundingClientRect()))) load(); }, 4000);
 
   // ---------- UI ----------
 
@@ -174,7 +176,7 @@
     } catch {
       res = { ok: false, error: 'The extension was updated. Reload this page.' };
     }
-    if (res?.ok) toast(`✓ Downloading ${row.label} in StreamGrab`, 'ok');
+    if (res?.ok) toast(`✓ Downloading ${row.label} in StreamGrab${res.warning ? ` (${res.warning})` : ''}`, 'ok', res.warning ? 7000 : 4000);
     else toast(`⚠ ${res?.error || 'Couldn’t reach StreamGrab.'}`, 'err', 7000);
   }
 

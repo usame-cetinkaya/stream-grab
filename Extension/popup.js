@@ -4,8 +4,9 @@ const $ = (s) => document.querySelector(s);
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
   chrome.runtime.sendMessage({ type: 'ping' }).then((res) => {
-    $('#status').textContent = res?.ok ? `App connected${res.ffmpeg ? '' : ' (no ffmpeg)'}` : 'App not found';
-    $('#status').className = res?.ok ? 'ok' : 'bad';
+    const running = res?.ok && res.appRunning;
+    $('#status').textContent = !res?.ok ? 'App not installed' : running ? `App running${res.ffmpeg ? '' : ' (no ffmpeg)'}` : 'App not running';
+    $('#status').className = running ? 'ok' : 'bad';
   });
   $('#open').onclick = () => chrome.runtime.sendMessage({ type: 'show' });
 
@@ -18,7 +19,7 @@ const $ = (s) => document.querySelector(s);
   for (const item of [...items].reverse()) {
     const group = document.createElement('div');
     group.className = 'group';
-    group.textContent = `${item.kind === 'hls' ? 'Stream' : 'File'} · ${new URL(item.url).hostname}`;
+    group.textContent = `${item.kind === 'direct' ? 'File' : 'Stream'} · ${new URL(item.url).hostname}`;
     list.append(group);
     item.qualities.forEach((q, index) => {
       const b = document.createElement('button');
@@ -31,7 +32,7 @@ const $ = (s) => document.querySelector(s);
       b.onclick = async () => {
         $('#msg').textContent = 'Sending…';
         const res = await chrome.runtime.sendMessage({ type: 'download', tabId: tab.id, itemId: item.id, quality: index, label: q.label });
-        $('#msg').textContent = res?.ok ? `✓ Downloading ${label}` : `⚠ ${res?.error || 'Failed'}`;
+        $('#msg').textContent = res?.ok ? `✓ Downloading ${label}${res.warning ? ` (${res.warning})` : ''}` : `⚠ ${res?.error || 'Failed'}`;
       };
       list.append(b);
     });

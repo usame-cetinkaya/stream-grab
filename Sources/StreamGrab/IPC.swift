@@ -22,7 +22,10 @@ enum Paths {
     static var installedExtension: URL { support.appendingPathComponent("Chrome Extension", isDirectory: true) }
 
     static var ffmpeg: URL? {
-        ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["STREAMGRAB_NO_FFMPEG"] != nil { return nil }
+        #endif
+        return ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
             .map { URL(fileURLWithPath: $0) }
     }

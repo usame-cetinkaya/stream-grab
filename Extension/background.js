@@ -1,4 +1,4 @@
-// StreamGrab: watches network traffic for video streams (HLS playlists and video files),
+// StreamGrab: watches network traffic for video streams (HLS playlists, DASH manifests, video files),
 // asks the StreamGrab app for the available qualities, and tells the page's content
 // script so it can show the "Download this video" button.
 
@@ -34,6 +34,15 @@ function native(message) {
   }));
 }
 
+/** Is the StreamGrab app open? Pages only get a button while it is. Cached briefly. */
+let appCheck = { at: 0, running: Promise.resolve(false) };
+function appRunning() {
+  if (Date.now() - appCheck.at > 3000) {
+    appCheck = { at: Date.now(), running: native({ type: 'ping' }).then((r) => !!(r.ok && r.appRunning)) };
+  }
+  return appCheck.running;
+}
+
 // ---------- Network sniffing ----------
 
 const FILTER = { urls: ['<all_urls>'], types: ['media', 'xmlhttprequest', 'other', 'object'] };
@@ -55,9 +64,11 @@ chrome.webRequest.onHeadersReceived.addListener((d) => {
   const get = (n) => (d.responseHeaders || []).find((h) => h.name.toLowerCase() === n)?.value || '';
   const kind = classify(d.url, get('content-type'));
   if (!kind) return;
+  const total = Number((get('content-range').split('/')[1]) || get('content-length') || 0);
   ready.then(() => {
-    if (kind === 'hls') onPlaylist(d, headers);
-    else onDirect(d, headers, get('content-range'), get('content-length'), get('content-type'));
+    if (kind === 'manifest') onManifest(d, headers);
+    else if (kind === 'audio') onAudio(d, headers, total);
+    else onDirect(d, headers, total, get('content-type'));
   });
 }, FILTER, ['responseHeaders']);
 
@@ -67,15 +78,20 @@ function classify(url, contentType) {
   if (!/^https?:$/.test(u.protocol)) return null;
   if (/(^|\.)googlevideo\.com$/.test(u.hostname)) return null; // YouTube's chunked streams
   const path = u.pathname.toLowerCase();
+  const name = path.split('/').pop();
   const ct = contentType.toLowerCase().split(';')[0].trim();
-  if (ct.includes('mpegurl') || path.endsWith('.m3u8')) return 'hls';
-  if (/\.(ts|m4s|aac|m4a|mp3|vtt|webvtt|key|cmfv|cmfa)$/.test(path)) return null;
+  if (ct.includes('mpegurl') || path.endsWith('.m3u8')) return 'manifest'; // HLS
+  if (ct === 'application/dash+xml' || path.endsWith('.mpd')) return 'manifest'; // DASH
+  if (/\.(ts|m4s|aac|mp3|vtt|webvtt|key|cmfv|cmfa)$/.test(path)) return null;
   if (ct === 'video/mp2t' || ct === 'video/iso.segment') return null;
+  // A separate sound track, e.g. "DASH_AUDIO_128.mp4" next to "DASH_720.mp4".
+  if (/^audio\/(mp4|webm|x-m4a)$/.test(ct) || /\.(m4a|weba)$/.test(path) || (/\.(mp4|webm)$/.test(path) && /audio/.test(name))) return 'audio';
   if (ct.startsWith('video/') || /\.(mp4|webm|mov|m4v|mkv|flv)$/.test(path)) return 'direct';
   return null;
 }
 
-async function onPlaylist(d, headers) {
+/** HLS playlists and DASH manifests: the app reads them and lists the qualities. */
+async function onManifest(d, headers) {
   const url = d.url;
   const key = `${d.tabId} ${url}`;
   if (childUrls.has(url) || seen.has(key)) return;
@@ -89,23 +105,28 @@ async function onPlaylist(d, headers) {
   if (!res.ok && !res.noApp) { seen.delete(key); return; } // not a playlist / fetch failed
   if (res.ok && res.live) return; // live streams aren't supported
   if (childUrls.has(url) || tabState(d.tabId).items.some((i) => i.url === url)) return;
+  if (res.prefixes) addPrefixes(d.tabId, res.prefixes);
 
-  const item = { id: crypto.randomUUID(), kind: 'hls', url, frameId: d.frameId, headers, added: Date.now() };
+  const item = { id: crypto.randomUUID(), kind: res.kind === 'dash' ? 'dash' : 'hls', url, frameId: d.frameId, headers, added: Date.now() };
   if (!res.ok) {
     // Without the app we can't read the playlist; offer one entry that explains what's missing.
     if (tabState(d.tabId).items.some((i) => i.noApp)) return;
     item.noApp = true;
     item.qualities = [{ label: 'Video stream', detail: 'needs the StreamGrab app', url }];
-  } else if (res.kind === 'master') {
-    for (const v of res.variants) { childUrls.add(v.url); if (v.audioUrl) childUrls.add(v.audioUrl); }
-    const s = tabState(d.tabId);
-    s.items = s.items.filter((i) => !childUrls.has(i.url)); // drop variants we already listed alone
+  } else if (res.kind === 'master' || res.kind === 'dash') {
+    if (res.kind === 'master') {
+      for (const v of res.variants) { childUrls.add(v.url); if (v.audioUrl) childUrls.add(v.audioUrl); }
+      const s = tabState(d.tabId);
+      s.items = s.items.filter((i) => !childUrls.has(i.url)); // drop variants we already listed alone
+    }
     item.drm = !!res.drm;
     item.qualities = res.variants.map((v) => ({
       label: v.height ? `${v.height}p${v.frameRate > 31 ? Math.round(v.frameRate) : ''}` : `${Math.round(v.bandwidth / 1000)} kbps`,
       detail: res.duration ? `~${formatSize((v.bandwidth * res.duration) / 8)}` : '',
       url: v.url,
       audioUrl: v.audioUrl,
+      videoId: v.videoId,
+      audioId: v.audioId,
       height: v.height,
     }));
   } else {
@@ -115,20 +136,67 @@ async function onPlaylist(d, headers) {
   addItem(d.tabId, item);
 }
 
-function onDirect(d, headers, contentRange, contentLength, contentType) {
-  const total = Number((contentRange.split('/')[1]) || contentLength || 0);
+/** Folders a stream loads its pieces from: files there are part of the stream, not videos of their own. */
+function addPrefixes(tabId, prefixes) {
+  const s = tabState(tabId);
+  s.prefixes ||= [];
+  for (const p of prefixes) {
+    try { if (new URL(p).pathname === '/') continue; } catch { continue; }
+    if (!s.prefixes.includes(p)) s.prefixes.push(p);
+  }
+  s.items = s.items.filter((i) => i.kind !== 'direct' || !isStreamPiece(s, i.url));
+}
+
+function isStreamPiece(s, url) {
+  return (s.prefixes || []).some((p) => url.startsWith(p));
+}
+
+function directory(url) {
+  const u = new URL(url);
+  return u.origin + u.pathname.replace(/[^/]*$/, '');
+}
+
+function onDirect(d, headers, total, contentType) {
   if (total && total < MIN_DIRECT_SIZE) return;
   const s = tabState(d.tabId);
-  if (s.items.some((i) => i.url === d.url)) return;
-  const hint = d.url.match(/[^\d](\d{3,4})p[^\w]/i);
-  addItem(d.tabId, {
+  if (s.items.some((i) => i.url === d.url) || isStreamPiece(s, d.url)) return;
+  const hint = d.url.match(/[^\d](\d{3,4})p[^\w]/i) || d.url.match(/_(\d{3,4})\.(mp4|webm)/i);
+  const item = {
     id: crypto.randomUUID(), kind: 'direct', url: d.url, frameId: d.frameId, headers, added: Date.now(),
     qualities: [{
       label: hint ? `${hint[1]}p` : '',
       detail: [total ? formatSize(total) : '', (contentType.split('/')[1] || '').split(';')[0].toUpperCase()].filter(Boolean).join(' · '),
       url: d.url,
     }],
-  });
+  };
+  pairAudio(s, item);
+  addItem(d.tabId, item);
+}
+
+/** Separate sound tracks are kept aside and attached to video files from the same folder. */
+function onAudio(d, headers, total) {
+  const s = tabState(d.tabId);
+  if (isStreamPiece(s, d.url)) return;
+  s.audio ||= [];
+  const known = s.audio.find((a) => a.url === d.url);
+  if (known) { known.size = Math.max(known.size, total); return; }
+  s.audio.push({ url: d.url, size: total });
+  if (s.audio.length > 20) s.audio.shift();
+  let changed = false;
+  for (const item of s.items) changed = pairAudio(s, item) || changed;
+  save();
+  if (changed) refresh(d.tabId);
+}
+
+function pairAudio(s, item) {
+  if (item.kind !== 'direct' || item.qualities[0].audioUrl) return false;
+  const dir = directory(item.url);
+  const audio = (s.audio || []).filter((a) => directory(a.url) === dir).sort((a, b) => b.size - a.size)[0];
+  if (!audio) return false;
+  const q = item.qualities[0];
+  q.audioUrl = audio.url;
+  q.detail = [q.detail, '+ sound'].filter(Boolean).join(' ');
+  return true;
 }
 
 function addItem(tabId, item) {
@@ -180,7 +248,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
           const s = tabState(tabId);
           if (!s.videoFrames.includes(sender.frameId)) { s.videoFrames.push(sender.frameId); save(); }
         }
-        const items = sender.tab ? itemsForFrame(tabId, sender.frameId) : tabs[tabId]?.items || [];
+        if (!sender.tab) return reply({ items: (tabs[tabId]?.items || []).map(publicItem) }); // popup
+        const items = itemsForFrame(tabId, sender.frameId);
+        if (!items.length || !(await appRunning())) return reply({ items: [] });
         return reply({ items: items.map(publicItem) });
       }
       case 'download': return reply(await download(tabId, msg.itemId, msg.quality, msg.label));
@@ -206,6 +276,8 @@ async function download(tabId, itemId, index, label) {
     kind: item.kind,
     url: q.url,
     audioURL: q.audioUrl || null,
+    videoID: q.videoId || null,
+    audioID: q.audioId || null,
     title: cleanTitle(tab?.title) || new URL(q.url).hostname,
     quality: label || q.label || null,
     pageURL: tab?.url || null,
